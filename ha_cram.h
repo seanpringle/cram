@@ -27,12 +27,14 @@
 
 #define CRAM_CHAINS 1000000
 #define CRAM_LOCKS 1000
-#define CRAM_WORKERS 8
-#define CRAM_JOBS 4
+#define CRAM_WORKERS 4
+#define CRAM_LOADERS 4
+#define CRAM_LISTS 4
 #define CRAM_EPOCH 1000000000
 #define CRAM_PAGE 100
 #define CRAM_FILE "cram%08llx"
-#define CRAM_CONCURRENCY 4
+#define CRAM_UINTS 1000
+#define CRAM_CACHE 3
 
 #define CRAM_LOG TRUE
 #define CRAM_NO_LOG FALSE
@@ -62,27 +64,35 @@ typedef struct _CramRow {
 
 typedef struct _CramPage {
   pthread_rwlock_t lock;
-  uint64 refs;
   uint32 count;
   uint32 list;
+  uchar *indexed;
+  uint changes;
   CramRow rows[CRAM_PAGE];
   struct _CramPage *next, *prev;
 } CramPage;
 
+typedef struct _CramIndex {
+  CramPage *page;
+  struct _CramIndex *next;
+} CramIndex;
+
 typedef struct _CramList {
+  pthread_rwlock_t lock;
+  pthread_mutex_t mutex;
   uint64 pages, rows;
   CramPage *first, *last;
-  pthread_rwlock_t lock;
-  pthread_spinlock_t spinlock;
+  CramIndex **index;
 } CramList;
 
 typedef struct _CramTable {
   pthread_rwlock_t lock;
-  pthread_spinlock_t spinlock;
+  pthread_mutex_t mutex;
   char *name;
   uint64 id;
   uint32 columns;
-  CramList lists[CRAM_JOBS];
+  uint next_list;
+  CramList *lists;
   struct _CramTable *next;
 } CramTable;
 
@@ -97,15 +107,26 @@ typedef struct _CramLogEvent {
   struct _CramLogEvent *next, *prev;
 } CramLogEvent;
 
+typedef struct _CramIndexEvent {
+  CramTable *table;
+  CramPage *page;
+  struct _CramIndexEvent *next;
+} CramIndexEvent;
+
 enum {
   CRAM_COND_EQ=1,
+  CRAM_COND_NE,
   CRAM_COND_IN,
   CRAM_COND_LT,
-  CRAM_COND_LT_STR,
   CRAM_COND_GT,
-  CRAM_COND_GT_STR,
+  CRAM_COND_LE,
+  CRAM_COND_GE,
   CRAM_COND_NULL,
   CRAM_COND_NOTNULL,
+  CRAM_COND_LT_STR,
+  CRAM_COND_GT_STR,
+  CRAM_COND_LE_STR,
+  CRAM_COND_GE_STR,
   CRAM_COND_LEADING,
   CRAM_COND_TRAILING,
   CRAM_COND_CONTAINS,
@@ -117,10 +138,11 @@ typedef struct _CramCondition {
   uint32 index;
   CramBlob **blobs;
   char *like;
-  uint like_len;
+  uint32 like_len;
   int64 number;
   uchar *buffer;
-  uint64 length;
+  uint32 length;
+  struct _CramCondition *next;
 } CramCondition;
 
 typedef struct _CramResult {
@@ -137,6 +159,7 @@ typedef struct _CramJob {
   uint64 steps, matches;
   CramCondition *condition;
   pthread_mutex_t mutex;
+  pthread_cond_t cond;
   struct _CramJob *next;
 } CramJob;
 
@@ -153,6 +176,15 @@ typedef struct _CramConsolidateJob {
   uint list;
   bool complete;
 } CramConsolidateJob;
+
+typedef struct _CramLoadJob {
+  FILE *file;
+  bool running;
+  bool complete;
+  bool success;
+  uint64 epoch;
+  pthread_t thread;
+} CramLoadJob;
 
 /** @brief
   Class definition for the storage engine
