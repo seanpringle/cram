@@ -31,16 +31,48 @@
 #define CRAM_LOADERS 4
 #define CRAM_LISTS 4
 #define CRAM_EPOCH 1000000000
-#define CRAM_PAGE 100
+#define CRAM_PAGE 128
 #define CRAM_FILE "cram%08llx"
 #define CRAM_UINTS 1000
 #define CRAM_CACHE 3
+#define CRAM_QUEUE 1024
 
 #define CRAM_LOG TRUE
 #define CRAM_NO_LOG FALSE
 
 #define CRAM_INSERT 1
 #define CRAM_APPEND 2
+
+typedef bool (*CramEqual)(void*, void*);
+typedef void* (*CramCreate)(void*, void*);
+typedef void (*CramDestroy)(void*, void*);
+
+typedef struct _CramQueue {
+  bool halt;
+  uint64 total, count, complete;
+  pthread_mutex_t mutex;
+  pthread_cond_t read_cond, write_cond, wait_cond;
+  size_t width, read, write;
+  void **items;
+} CramQueue;
+
+typedef struct _CramNode {
+  void *item;
+  uint64 count;
+  struct _CramNode *next;
+} CramNode;
+
+typedef struct _CramHash {
+  size_t width, locks;
+  CramNode **chains;
+  pthread_rwlock_t *rwlocks;
+} CramHash;
+
+typedef struct _CramList {
+  size_t length;
+  pthread_rwlock_t rwlock;
+  CramNode *first, *last;
+} CramList;
 
 enum {
   CRAM_ENTRY_CREATE=1,
@@ -51,10 +83,8 @@ enum {
 };
 
 typedef struct _CramBlob {
-  uint64 count;
   uint32 length;
   uchar *buffer;
-  struct _CramBlob *next;
 } CramBlob;
 
 typedef struct _CramRow {
@@ -65,53 +95,24 @@ typedef struct _CramRow {
 typedef struct _CramPage {
   pthread_rwlock_t lock;
   uint32 count;
-  uint32 list;
-  uchar *indexed;
-  uint changes;
-  CramRow rows[CRAM_PAGE];
-  struct _CramPage *next, *prev;
+  CramList *list;
+  CramRow *rows;
 } CramPage;
-
-typedef struct _CramIndex {
-  CramPage *page;
-  struct _CramIndex *next;
-} CramIndex;
-
-typedef struct _CramList {
-  pthread_rwlock_t lock;
-  pthread_mutex_t mutex;
-  uint64 pages, rows;
-  CramPage *first, *last;
-  CramIndex **index;
-} CramList;
 
 typedef struct _CramTable {
   pthread_rwlock_t lock;
-  pthread_mutex_t mutex;
   char *name;
   uint64 id;
   uint32 columns;
-  uint next_list;
-  CramList *lists;
-  struct _CramTable *next;
+  CramList **lists;
 } CramTable;
-
-typedef struct _CramHash {
-  pthread_mutex_t *mutexes;
-  CramBlob **chains;
-} CramHash;
 
 typedef struct _CramLogEvent {
   uchar *data;
   size_t width;
-  struct _CramLogEvent *next, *prev;
+  uchar *cdata;
+  size_t cwidth;
 } CramLogEvent;
-
-typedef struct _CramIndexEvent {
-  CramTable *table;
-  CramPage *page;
-  struct _CramIndexEvent *next;
-} CramIndexEvent;
 
 enum {
   CRAM_COND_EQ=1,

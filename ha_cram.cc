@@ -25,6 +25,7 @@
 #include "ha_cram.h"
 #include "sql_class.h"
 #include <pthread.h>
+#include <zlib.h>
 
 static handler *cram_create_handler(handlerton *hton, TABLE_SHARE *table, MEM_ROOT *mem_root);
 
@@ -42,16 +43,13 @@ static uint64 cram_epoch_eof;
 static pthread_mutex_t cram_epoch_mutex;
 
 /* A global hash table that holds actual data BLOBs */
-static CramHash cram_hash;
+static CramHash *cram_hash;
 static uint cram_hash_chains;
 static uint cram_hash_locks;
-static CramBlob cram_hash_uints[CRAM_UINTS];
-static uint64 cram_hash_uint_bufs[CRAM_UINTS];
 
 /* List of open tables */
-static CramTable *cram_tables;
+static CramList *cram_tables;
 static CramWorker *cram_workers;
-static pthread_mutex_t cram_tables_mutex;
 
 /* Every table and record gets an id */
 static uint64 cram_sequence;
@@ -65,6 +63,7 @@ static uint cram_strict_write;
 static uint cram_flush_level;
 static uint cram_page_rows;
 static uint cram_compress_log;
+static uint cram_precompress_log; // not exposed to MariaDB
 static uint cram_verbose;
 static uint cram_table_lists;
 static uint cram_indexing;
@@ -89,21 +88,12 @@ static ulonglong cram_log_writes_queued;
 static ulonglong cram_log_writes_completed;
 
 /* Background worker thread job list */
-static CramJob *cram_job;
-static pthread_mutex_t cram_job_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t cram_job_cond = PTHREAD_COND_INITIALIZER;
+static CramQueue *cram_job_queue;
 
 /* Background log-writer thread */
+static CramQueue *cram_write_queue;
 static pthread_t cram_writer_thread;
-static pthread_spinlock_t cram_log_events_spinlock;
-static CramLogEvent *cram_log_events;
 static bool cram_writer_done;
-
-/* Background indexer thread */
-static pthread_t cram_indexer_thread;
-static pthread_spinlock_t cram_index_events_spinlock;
-static CramIndexEvent *cram_index_events;
-static bool cram_indexer_done;
 
 static void cram_note(const char *format, ...)
 {
@@ -125,6 +115,7 @@ static void cram_error(const char *format, ...)
   va_end(args);
 }
 
+#define cram_assert(f,...) do { if (!f) cram_error(__VA_ARGS__); abort(); } while(0)
 #define cram_debug(...) if (cram_verbose) cram_note(__VA_ARGS__)
 
 static void* cram_alloc(size_t bytes)
@@ -143,16 +134,367 @@ static void cram_free(void *ptr)
   free(ptr);
 }
 
+static void cram_queue_init(CramQueue *queue, size_t width)
+{
+  memset(queue, 0, sizeof(CramQueue));
+  pthread_mutex_init(&queue->mutex, NULL);
+  pthread_cond_init(&queue->read_cond, NULL);
+  pthread_cond_init(&queue->write_cond, NULL);
+  pthread_cond_init(&queue->wait_cond, NULL);
+  queue->items = (void**) cram_alloc(sizeof(void*) * width);
+  queue->width = width;
+}
+
+static void cram_queue_destroy(CramQueue *queue)
+{
+  pthread_cond_destroy(&queue->read_cond);
+  pthread_cond_destroy(&queue->write_cond);
+  pthread_cond_destroy(&queue->wait_cond);
+  pthread_mutex_destroy(&queue->mutex);
+  cram_free(queue->items);
+}
+
+static CramQueue* cram_queue_create(size_t width)
+{
+  CramQueue *queue = (CramQueue*) cram_alloc(sizeof(CramQueue));
+  cram_queue_init(queue, width);
+  return queue;
+}
+
+static void cram_queue_free(CramQueue *queue)
+{
+  cram_queue_destroy(queue);
+  cram_free(queue);
+}
+
+static void cram_queue_submit(CramQueue *queue, void *ptr)
+{
+  pthread_mutex_lock(&queue->mutex);
+
+  while (!queue->halt && queue->count == queue->width)
+    pthread_cond_wait(&queue->write_cond, &queue->mutex);
+
+  if (!queue->halt)
+  {
+    if (queue->write == queue->width)
+      queue->write = 0;
+    queue->items[queue->write++] = ptr;
+    queue->count++;
+    queue->total++;
+    pthread_cond_signal(&queue->read_cond);
+  }
+  pthread_mutex_unlock(&queue->mutex);
+}
+
+static void* cram_queue_accept(CramQueue *queue)
+{
+  void *ptr = NULL;
+  pthread_mutex_lock(&queue->mutex);
+
+  while (!queue->halt && queue->count == 0)
+    pthread_cond_wait(&queue->read_cond, &queue->mutex);
+
+  if (!queue->halt)
+  {
+    if (queue->read == queue->width)
+      queue->read = 0;
+    ptr = queue->items[queue->read++];
+    queue->count--;
+    pthread_cond_signal(&queue->write_cond);
+  }
+  pthread_mutex_unlock(&queue->mutex);
+  return ptr;
+}
+
+static void cram_queue_bump(CramQueue *queue)
+{
+  pthread_mutex_lock(&queue->mutex);
+  queue->complete++;
+  pthread_cond_broadcast(&queue->wait_cond);
+  pthread_mutex_unlock(&queue->mutex);
+}
+
+static void cram_queue_halt(CramQueue *queue)
+{
+  pthread_mutex_lock(&queue->mutex);
+  queue->halt = TRUE;
+  pthread_cond_broadcast(&queue->read_cond);
+  pthread_cond_broadcast(&queue->write_cond);
+  pthread_mutex_unlock(&queue->mutex);
+}
+
+static void cram_queue_resume(CramQueue *queue)
+{
+  pthread_mutex_lock(&queue->mutex);
+  queue->halt = FALSE;
+  pthread_cond_broadcast(&queue->read_cond);
+  pthread_cond_broadcast(&queue->write_cond);
+  pthread_mutex_unlock(&queue->mutex);
+}
+
+static void cram_queue_wait(CramQueue *queue)
+{
+  pthread_mutex_lock(&queue->mutex);
+  if (queue->total > queue->complete)
+  {
+    uint64 events = queue->total;
+    while (!queue->halt && queue->complete < events)
+      pthread_cond_wait(&queue->wait_cond, &queue->mutex);
+  }
+  pthread_mutex_unlock(&queue->mutex);
+}
+
+static void cram_list_init(CramList *list)
+{
+  pthread_rwlock_init(&list->rwlock, NULL);
+}
+
+static void cram_list_destroy(CramList *list)
+{
+  while (list->first) {
+    CramNode *node = list->first->next;
+    cram_free(node);
+    list->first = node;
+  }
+  pthread_rwlock_destroy(&list->rwlock);
+}
+
+static CramList* cram_list_create()
+{
+  CramList *list = (CramList*) cram_alloc(sizeof(CramList));
+  cram_list_init(list);
+  return list;
+}
+
+static void cram_list_free(CramList *list)
+{
+  cram_list_destroy(list);
+  cram_free(list);
+}
+
+static void cram_list_open_read(CramList *list)
+{
+  pthread_rwlock_rdlock(&list->rwlock);
+}
+
+static void cram_list_open_write(CramList *list)
+{
+  pthread_rwlock_wrlock(&list->rwlock);
+}
+
+static void cram_list_close(CramList *list)
+{
+  pthread_rwlock_unlock(&list->rwlock);
+}
+
+static void cram_list_push(CramList *list, void *item)
+{
+  CramNode *node = (CramNode*) cram_alloc(sizeof(CramNode));
+  if (list->last) {
+    list->last->next = node;
+    list->last = node;
+  } else {
+    list->first = node;
+    list->last  = node;
+  }
+  list->length++;
+  node->item = item;
+}
+
+static void cram_list_shunt(CramList *list, void *item)
+{
+  CramNode *node = (CramNode*) cram_alloc(sizeof(CramNode));
+  node->next = list->first;
+  list->first = node;
+  if (!list->last)
+    list->last = node;
+  list->length++;
+  node->item = item;
+}
+
+static void* cram_list_remove(CramList *list, CramEqual equal, void *context)
+{
+  void *item = NULL;
+  CramNode *prev = NULL, *node = list->first;
+  for (; node && !equal(node->item, context); prev = node, node = node->next);
+  if (node) {
+    if (node == list->first) list->first = node->next;
+    if (node == list->last)  list->last  = prev;
+    if (prev) prev->next = node->next;
+    cram_free(node);
+    list->length--;
+  }
+  return item;
+}
+
+static bool cram_list_cb(void *item, void *context)
+{
+  return item == context;
+}
+
+static void* cram_list_pop(CramList *list)
+{
+  return cram_list_remove(list, cram_list_cb, list->first);
+}
+
+static void* cram_list_shift(CramList *list)
+{
+  return cram_list_remove(list, cram_list_cb, list->last);
+}
+
+static void* cram_list_walk(CramList *list, CramEqual equal, void *context)
+{
+  CramNode *node = list->first;
+  while (node && !equal(node->item, context))
+    node = node->next;
+  return node ? node->item: NULL;
+}
+
+static void cram_hash_init(CramHash *hash, size_t width, size_t locks)
+{
+  hash->width = width;
+  hash->locks = locks;
+  hash->chains  = (CramNode**) cram_alloc(sizeof(CramNode*) * width);
+  hash->rwlocks = (pthread_rwlock_t*) cram_alloc(sizeof(pthread_rwlock_t) * locks);
+  for (size_t i = 0; i < locks; i++)
+    pthread_rwlock_init(&hash->rwlocks[i], NULL);
+}
+
+static void cram_hash_destroy(CramHash *hash)
+{
+  for (size_t i = 0; i < hash->width; i++) {
+    while (hash->chains[i]) {
+      CramNode *next = hash->chains[i]->next;
+      cram_free(hash->chains[i]);
+      hash->chains[i] = next;
+  }}
+  for (size_t i = 0; i < hash->locks; i++)
+    pthread_rwlock_destroy(&hash->rwlocks[i]);
+  cram_free(hash->rwlocks);
+  cram_free(hash->chains);
+}
+
+static CramHash* cram_hash_create(size_t width, size_t locks)
+{
+  CramHash *hash = (CramHash*) cram_alloc(sizeof(CramHash));
+  cram_hash_init(hash, width, locks);
+  return hash;
+}
+
+static void cram_hash_free(CramHash *hash)
+{
+  cram_hash_destroy(hash);
+  cram_free(hash);
+}
+
+static void cram_hash_open_read(CramHash *hash, uint hashval)
+{
+  uint lock = hashval % hash->locks;
+  pthread_rwlock_wrlock(&hash->rwlocks[lock]);
+}
+
+static void cram_hash_open_write(CramHash *hash, uint hashval)
+{
+  uint lock = hashval % hash->locks;
+  pthread_rwlock_wrlock(&hash->rwlocks[lock]);
+}
+
+static void cram_hash_close(CramHash *hash, uint hashval)
+{
+  uint lock = hashval % hash->locks;
+  pthread_rwlock_unlock(&hash->rwlocks[lock]);
+}
+
+static void* cram_hash_get(CramHash *hash, uint hashval, CramEqual equal, void *context)
+{
+  uint chain = hashval % hash->width;
+  CramNode *n = hash->chains[chain];
+  while (n && !equal(n->item, context))
+    n = n->next;
+  return n ? n->item: NULL;
+}
+
+static void* cram_hash_incref(CramHash *hash, uint hashval, CramEqual equal, void *context, CramCreate create)
+{
+  uint chain = hashval % hash->width;
+  CramNode *n = hash->chains[chain];
+  while (n && !equal(n->item, context))
+    n = n->next;
+  if (!n)
+  {
+    n = (CramNode*) cram_alloc(sizeof(CramNode));
+    n->count = 0;
+    n->item = create(n, context);
+    n->next = hash->chains[chain];
+    hash->chains[chain] = n;
+  }
+  n->count++;
+  return n->item;
+}
+
+static void cram_hash_decref(CramHash *hash, uint hashval, CramEqual equal, void *context, CramDestroy destroy)
+{
+  uint chain = hashval % hash->width;
+  CramNode **n = &hash->chains[chain];
+  while (n && (*n) && !equal((*n)->item, context))
+    n = &(*n)->next;
+  if (n && (*n))
+  {
+    (*n)->count--;
+    if ((*n)->count == 0)
+    {
+      CramNode *f = (*n);
+      *n = (*n)->next;
+      if (destroy) destroy(f->item, context);
+      cram_free(f);
+    }
+  }
+}
+
 static size_t cram_deflate(uchar *data, size_t width)
 {
-  size_t length = width, comp_len = 0;
-  return (my_compress(data, &length, &comp_len) == 0 && length < width) ? length: UINT_MAX;
+  uchar *buff = (uchar*) cram_alloc(width);
+  uint length = width;
+
+  z_stream stream;
+  int err;
+
+  stream.next_in = (Bytef*)data;
+  stream.avail_in = (uInt)width;
+  stream.next_out = (Bytef*)buff;
+  stream.avail_out = (uInt)length;
+
+  stream.zalloc = Z_NULL;
+  stream.zfree = Z_NULL;
+  stream.opaque = Z_NULL;
+
+  err = deflateInit2(&stream, Z_BEST_SPEED, Z_DEFLATED, 15, 9, Z_HUFFMAN_ONLY);
+  if (err != Z_OK) goto oops;
+
+  err = deflate(&stream, Z_FINISH);
+  if (err != Z_STREAM_END) goto oops;
+
+  length = stream.total_out;
+  deflateEnd(&stream);
+  memmove(data, buff, length);
+  cram_free(buff);
+  return length;
+
+oops:
+  length = UINT_MAX;
+  cram_free(buff);
+  return length;
 }
 
 static size_t cram_inflate(uchar *data, size_t width, size_t limit)
 {
-  size_t a = width, b = limit;
-  return my_uncompress(data, a, &b) != 0 ? UINT_MAX: limit;
+  size_t length = limit;
+  uchar *buff = (uchar*) cram_alloc(limit);
+  int err = uncompress(buff, &length, data, width);
+  if (err != Z_OK) length = UINT_MAX;
+  else memmove(data, buff, length);
+  cram_free(buff);
+  return length;
 }
 
 static uint64 cram_id_create()
@@ -173,7 +515,6 @@ static int cram_log_insert(CramTable *table, CramRow *row);
 static int cram_init_insert(uchar *data);
 static int cram_log_delete(CramTable *table, uint64 id);
 static int cram_init_delete(uchar *data);
-static void cram_schedule_index(CramTable *table, CramPage *page);
 
 static void cram_stat_add(pthread_spinlock_t *spin, ulonglong *var, ulonglong n)
 {
@@ -196,9 +537,9 @@ static void cram_stat2_add(pthread_spinlock_t *spin, ulonglong *a, ulonglong *b,
 }
 
 /* DJBX33A */
-static uint32 cram_hash_calc(uchar *buffer, uint32 length)
+static uint32 cram_hash33(uchar *buffer, size_t length)
 {
-  uint32 hash = 5381, i = 0;
+  uint32 hash = 5381; size_t i = 0;
   for (
     length = length > 1024 ? 1024: length, i = 0;
     i < length;
@@ -207,117 +548,83 @@ static uint32 cram_hash_calc(uchar *buffer, uint32 length)
   return hash;
 }
 
-static CramBlob* cram_get(uchar *buffer, uint32 length)
+struct cram_hash_context {
+  uchar *buffer;
+  size_t length;
+  bool deleted;
+  bool created;
+};
+
+static bool cram_hash_cmp(void *item, void *context)
 {
-  if (length == sizeof(uint64) && *((uint64*)buffer) < CRAM_UINTS)
-  {
-    return &cram_hash_uints[*((uint64*)buffer)];
-  }
+  CramBlob *blob = (CramBlob*) item;
+  struct cram_hash_context *st = (struct cram_hash_context*) context;
+  return blob && st->length == blob->length && memcmp(st->buffer, blob->buffer, st->length) == 0;
+}
 
-  uint32 hash = cram_hash_calc(buffer, length);
-  uint chain = hash % cram_hash_chains;
-  uint lock  = hash % cram_hash_locks;
+static void* cram_blob_create(void *item, void *context)
+{
+  struct cram_hash_context *st = (struct cram_hash_context*) context;
+  CramBlob *blob = (CramBlob*) cram_alloc(sizeof(CramBlob));
+  blob->buffer = (uchar*) cram_alloc(st->length);
+  memmove(blob->buffer, st->buffer, st->length);
+  blob->length = st->length;
+  st->created = TRUE;
+  return blob;
+}
 
-  pthread_mutex_lock(&cram_hash.mutexes[lock]);
+static void cram_blob_free(void *item, void *context)
+{
+  struct cram_hash_context *st = (struct cram_hash_context*) context;
+  CramBlob *blob = (CramBlob*) item;
+  cram_free(blob->buffer);
+  cram_free(blob);
+  st->deleted = TRUE;
+}
 
-  CramBlob *n = cram_hash.chains[chain];
-
-  while (n && (length != n->length || memcmp(buffer, n->buffer, length)))
-    n = n->next;
-
-  pthread_mutex_unlock(&cram_hash.mutexes[lock]);
-
+static CramBlob* cram_blob_get(uchar *buffer, size_t length)
+{
+  uint hashval = cram_hash33(buffer, length);
+  struct cram_hash_context st;
+  memset(&st, 0, sizeof(struct cram_hash_context));
+  st.buffer = buffer; st.length = length;
+  cram_hash_open_read(cram_hash, hashval);
+  CramBlob *blob = (CramBlob*) cram_hash_get(cram_hash, hashval, cram_hash_cmp, &st);
+  cram_hash_close(cram_hash, hashval);
   cram_stat_inc(&cram_stats_spinlock, &cram_hash_reads);
-  return n;
+  return blob;
 }
 
-static CramBlob* cram_incref(uchar *buffer, uint32 length)
+static CramBlob* cram_blob_inc(uchar *buffer, size_t length)
 {
-  if (length == sizeof(uint64) && *((uint64*)buffer) < CRAM_UINTS)
-  {
-    return &cram_hash_uints[*((uint64*)buffer)];
-  }
-
-  bool created = FALSE;
-
-  uint32 hash = cram_hash_calc(buffer, length);
-  uint chain = hash % cram_hash_chains;
-  uint lock  = hash % cram_hash_locks;
-
-  pthread_mutex_lock(&cram_hash.mutexes[lock]);
-
-  CramBlob *n = cram_hash.chains[chain];
-
-  while (n && (length != n->length || memcmp(buffer, n->buffer, length)))
-    n = n->next;
-
-  if (!n)
-  {
-    n = (CramBlob*) cram_alloc(sizeof(CramBlob));
-
-    n->buffer = (uchar*) cram_alloc(length);
-    memmove(n->buffer, buffer, length);
-    n->length = length;
-
-    n->next = cram_hash.chains[chain];
-    cram_hash.chains[chain] = n;
-    created = TRUE;
-  }
-
-  n->count++;
-
-  pthread_mutex_unlock(&cram_hash.mutexes[lock]);
-
-  cram_stat2_add(&cram_stats_spinlock, &cram_hash_reads, &cram_hash_inserts, 1, created ? 1:0);
-  return n;
+  uint hashval = cram_hash33(buffer, length);
+  struct cram_hash_context st;
+  memset(&st, 0, sizeof(struct cram_hash_context));
+  st.buffer = buffer; st.length = length;
+  cram_hash_open_write(cram_hash, hashval);
+  CramBlob *blob = (CramBlob*) cram_hash_incref(cram_hash, hashval, cram_hash_cmp, &st, cram_blob_create);
+  cram_hash_close(cram_hash, hashval);
+  if (st.created) cram_stat_inc(&cram_stats_spinlock, &cram_hash_inserts);
+  return blob;
 }
 
-static int cram_decref(uchar *buffer, uint32 length)
+static void cram_blob_dec(uchar *buffer, size_t length)
 {
-  if (length == sizeof(uint64) && *((uint64*)buffer) < CRAM_UINTS)
-  {
-    return 0;
-  }
-
-  bool deleted = FALSE;
-  uint32 hash = cram_hash_calc(buffer, length);
-  uint chain = hash % cram_hash_chains;
-  uint lock  = hash % cram_hash_locks;
-
-  pthread_mutex_lock(&cram_hash.mutexes[lock]);
-
-  CramBlob **n = &cram_hash.chains[chain];
-
-  while (n && (*n) && (length != (*n)->length || memcmp(buffer, (*n)->buffer, length)))
-    n = &(*n)->next;
-
-  int rc = -1;
-
-  if (n && *n)
-  {
-    (*n)->count--;
-    if ((*n)->count == 0)
-    {
-      CramBlob *f = (*n);
-      *n = (*n)->next;
-      cram_free(f->buffer);
-      cram_free(f);
-      deleted = TRUE;
-    }
-    rc = 0;
-  }
-
-  pthread_mutex_unlock(&cram_hash.mutexes[lock]);
-
-  cram_stat2_add(&cram_stats_spinlock, &cram_hash_reads, &cram_hash_deletes, 1, deleted ? 1:0);
-  return rc;
+  uint hashval = cram_hash33(buffer, length);
+  struct cram_hash_context st;
+  memset(&st, 0, sizeof(struct cram_hash_context));
+  st.buffer = buffer; st.length = length;
+  cram_hash_open_write(cram_hash, hashval);
+  cram_hash_decref(cram_hash, hashval, cram_hash_cmp, &st, cram_blob_free);
+  cram_hash_close(cram_hash, hashval);
+  if (st.deleted) cram_stat_inc(&cram_stats_spinlock, &cram_hash_deletes);
 }
 
 void cram_field_set(CramBlob **blobs, uint index, Field *field)
 {
   if (blobs[index])
   {
-    cram_decref(blobs[index]->buffer, blobs[index]->length);
+    cram_blob_dec(blobs[index]->buffer, blobs[index]->length);
   }
 
   if (field->is_null())
@@ -328,129 +635,22 @@ void cram_field_set(CramBlob **blobs, uint index, Field *field)
   if (field->result_type() == INT_RESULT)
   {
     int64 n = field->val_int();
-    blobs[index] = cram_incref((uchar*)(&n), sizeof(int64));
+    blobs[index] = cram_blob_inc((uchar*)(&n), sizeof(int64));
   }
   else
   {
     char pad[1024];
     String tmp(pad, sizeof(pad), &my_charset_bin);
     field->val_str(&tmp, &tmp);
-    blobs[index] = cram_incref((uchar*)tmp.ptr(), tmp.length());
-  }
-}
-
-static uint cram_index_width(CramTable *table)
-{
-  return table->columns * cram_page_rows;
-}
-
-static void cram_row_index(CramTable *table, CramPage *page, CramBlob **blobs)
-{
-  CramList *list = &table->lists[page->list];
-  pthread_mutex_lock(&list->mutex);
-  uint count = 0, chains[table->columns];
-  for (uint i = 0; i < table->columns; i++)
-  {
-    uint chain = 0;
-    if (blobs[i] != NULL)
-    {
-      uint32 hash = cram_hash_calc(blobs[i]->buffer, blobs[i]->length);
-      chain = (hash % cram_index_width(table));
-    }
-    if (page->indexed[chain/8U] & (1U<<(chain%8U)))
-      continue;
-
-    bool is_new = TRUE;
-    for (uint j = 0; is_new && j < count; j++)
-    {
-      if (chains[j] == chain)
-        is_new = FALSE;
-    }
-    if (is_new)
-      chains[count++] = chain;
-  }
-  for (uint i = 0; i < count; i++)
-  {
-    uint chain = chains[i];
-    CramIndex *idx = (CramIndex*) cram_alloc(sizeof(CramIndex));
-    idx->page = page;
-    idx->next = list->index[chain];
-    list->index[chain] = idx;
-    page->indexed[chain/8U] |= (1U<<(chain%8U));
-  }
-  pthread_mutex_unlock(&list->mutex);
-}
-
-static void cram_page_deindex(CramTable *table, CramPage *page)
-{
-  CramList *list = &table->lists[page->list];
-  pthread_mutex_lock(&list->mutex);
-  for (uint chain = 0; chain < cram_index_width(table); chain++)
-  {
-    if (!(page->indexed[chain/8U] & (1U<<(chain%8U))))
-      continue;
-
-    CramIndex **idx = &list->index[chain];
-    while (idx && (*idx))
-    {
-      if ((*idx)->page == page)
-      {
-        CramIndex *drop = (*idx);
-        *idx = (*idx)->next;
-        cram_free(drop);
-        break;
-      }
-      idx = &(*idx)->next;
-    }
-  }
-  pthread_mutex_unlock(&list->mutex);
-  memset(page->indexed, 0, (cram_index_width(table) / 8) + 1);
-}
-
-static void cram_page_index(CramTable *table, CramPage *page)
-{
-  cram_page_deindex(table, page);
-
-  for (uint i = 0; i < cram_page_rows; i++)
-  {
-    if (page->rows[i].blobs)
-      cram_row_index(table, page, page->rows[i].blobs);
-  }
-
-  page->changes = 0;
-}
-
-static void cram_page_changed(CramTable *table, CramPage *page)
-{
-  if (++page->changes > (cram_page_rows/10))
-  {
-    cram_schedule_index(table, page);
-    page->changes = 0;
+    blobs[index] = cram_blob_inc((uchar*)tmp.ptr(), tmp.length());
   }
 }
 
 static void cram_page_free(CramTable *table, CramPage *page)
 {
-  cram_page_deindex(table, page);
-  if (page->prev)
-  {
-    page->prev->next = page->next;
-  }
-  for (uint i = 0; i < cram_table_lists; i++)
-  {
-    if (table->lists[i].first == page)
-    {
-      table->lists[i].first = page->next;
-    }
-    if (table->lists[i].last == page)
-    {
-      table->lists[i].last = page->prev;
-    }
-  }
-  cram_free(page->indexed);
+  cram_free(page->rows);
   pthread_rwlock_destroy(&page->lock);
   cram_free(page);
-
   cram_stat_inc(&cram_stats_spinlock, &cram_pages_deleted);
 }
 
@@ -462,50 +662,19 @@ static CramRow* cram_row_create(CramTable *table, uint64 id, CramBlob **blobs, b
   bool page_created = FALSE;
 
   if (!id)
-  {
     id = cram_id_create();
-  }
 
   if (!blobs)
-  {
     blobs = (CramBlob**) cram_alloc(sizeof(CramBlob*) * table->columns);
-  }
 
-  if (insert_mode == CRAM_APPEND)
+  list = table->lists[id % cram_table_lists];
+
+  cram_list_open_read(list);
+  CramNode *n = list->first; CramPage *p;
+
+  for (uint i = 0; n && !row; n = n->next, i++)
   {
-    pthread_mutex_lock(&table->mutex);
-    list = &table->lists[table->next_list++];
-    if (table->next_list == cram_table_lists)
-      table->next_list = 0;
-    pthread_mutex_unlock(&table->mutex);
-  }
-  else
-  {
-    // Choose a page list to scan. Prefer one with fewest rows so
-    // as to keep them all roughly in balance.
-    uint i, l = 0;
-    pthread_mutex_lock(&table->lists[0].mutex);
-    uint64 rows = table->lists[0].rows;
-    pthread_mutex_unlock(&table->lists[0].mutex);
-
-    for (i = 1; i < cram_table_lists; i++)
-    {
-      pthread_mutex_lock(&table->lists[i].mutex);
-      if (table->lists[i].rows < rows)
-      {
-        l = i;
-        rows = table->lists[i].rows;
-      }
-      pthread_mutex_unlock(&table->lists[i].mutex);
-    }
-    list = &table->lists[l];
-  }
-
-  pthread_rwlock_rdlock(&list->lock);
-  CramPage *p = list->first;
-
-  for (uint i = 0; p && !row; p = p->next, i++)
-  {
+    p = (CramPage*) n->item;
     // If someone else has a lock, just skip onward because we
     // really don't care where rows are inserted. This reduces
     // stalls for worker threads *especially*.
@@ -544,48 +713,34 @@ static CramRow* cram_row_create(CramTable *table, uint64 id, CramBlob **blobs, b
       pthread_rwlock_unlock(&p->lock);
     }
     // Append mode just means "don't scan the whole page list".
-    if (insert_mode == CRAM_APPEND && i > 0)
+    if (insert_mode == CRAM_APPEND && i > cram_loader_threads)
       break;
   }
 
-  pthread_rwlock_unlock(&list->lock);
+  cram_list_close(list);
 
   page = (CramPage*) cram_alloc(sizeof(CramPage));
   pthread_rwlock_init(&page->lock, NULL);
   pthread_rwlock_wrlock(&page->lock);
-  page->indexed = (uchar*) cram_alloc((cram_index_width(table) / 8) + 1);
+  page->rows = (CramRow*) cram_alloc(sizeof(CramRow) * cram_page_rows);
   page_created = TRUE;
   row = &page->rows[0];
-  page->list = list - table->lists;
+  page->list = list;
 
-  pthread_rwlock_wrlock(&list->lock);
-
-  if (!list->last) list->last = page;
-  page->next = list->first;
-  list->first = page;
-  list->pages++;
-  if (page->next) page->next->prev = page;
+  cram_list_open_write(list);
+  cram_list_shunt(list, page);
 
 done:
+  cram_list_close(list);
 
   page->count++;
   row->id = id;
   row->blobs = blobs;
 
   if (log_entry)
-  {
     cram_log_insert(table, row);
-  }
 
-  cram_row_index(table, page, row->blobs);
   pthread_rwlock_unlock(&page->lock);
-
-  pthread_mutex_lock(&list->mutex);
-  list->rows++;
-  if (page_created) list->pages++;
-  pthread_mutex_unlock(&list->mutex);
-
-  pthread_rwlock_unlock(&list->lock);
 
   pthread_spin_lock(&cram_stats_spinlock);
   cram_rows_created++;
@@ -601,12 +756,12 @@ static int cram_row_free(CramTable *table, CramPage *page, CramRow *row, bool lo
 {
   int rc = HA_ERR_RECORD_DELETED;
 
-  CramList *list = &table->lists[page->list];
+  CramList *list = page->list;
 
   uint64 id = 0;
   CramBlob **blobs = NULL;
 
-  pthread_rwlock_rdlock(&list->lock);
+  cram_list_open_read(list);
   pthread_rwlock_wrlock(&page->lock);
 
   if (row->blobs)
@@ -615,28 +770,20 @@ static int cram_row_free(CramTable *table, CramPage *page, CramRow *row, bool lo
     blobs = row->blobs;
     row->blobs = NULL;
     page->count--;
-    pthread_mutex_lock(&list->mutex);
-    list->rows--;
-    pthread_mutex_unlock(&list->mutex);
-
-    cram_page_changed(table, page);
   }
 
   pthread_rwlock_unlock(&page->lock);
-  pthread_rwlock_unlock(&list->lock);
+  cram_list_close(list);
 
   if (blobs)
   {
     if (log_entry)
-    {
       cram_log_delete(table, id);
-    }
+
     for (uint i = 0; i < table->columns; i++)
     {
       if (blobs[i])
-      {
-        cram_decref(blobs[i]->buffer, blobs[i]->length);
-      }
+        cram_blob_dec(blobs[i]->buffer, blobs[i]->length);
     }
     cram_free(blobs);
     cram_stat_inc(&cram_stats_spinlock, &cram_rows_deleted);
@@ -646,28 +793,32 @@ static int cram_row_free(CramTable *table, CramPage *page, CramRow *row, bool lo
   return rc;
 }
 
+static bool cram_table_by_name_cb(void *item, void *context)
+{
+  return strcmp(((CramTable*)item)->name, (char*)context) == 0;
+}
+
+static bool cram_table_by_id_cb(void *item, void *context)
+{
+  return ((CramTable*)item)->id == *((uint64*)context);
+}
+
 static CramTable* cram_table_open(const char *name, uint32 columns, uint64 id)
 {
   bool created = FALSE;
 
   if (!id)
-  {
     id = cram_id_create();
-  }
 
-  pthread_mutex_lock(&cram_tables_mutex);
-
-  CramTable *table = cram_tables;
-  while (table && strcmp(table->name, name))
-  {
-    table = table->next;
-  }
+  cram_list_open_write(cram_tables);
+  CramTable *table = (CramTable*) cram_list_walk(cram_tables, cram_table_by_name_cb, (void*)name);
 
   if (!table)
   {
+    cram_debug("creating %s", name);
+
     table = (CramTable*) cram_alloc(sizeof(CramTable));
     pthread_rwlock_init(&table->lock, NULL);
-    pthread_mutex_init(&table->mutex, NULL);
 
     table->name = (char*) cram_alloc(strlen(name)+1);
     strcpy(table->name, name);
@@ -675,186 +826,83 @@ static CramTable* cram_table_open(const char *name, uint32 columns, uint64 id)
     table->id = id;
     table->columns = columns;
 
-    table->lists = (CramList*) cram_alloc(sizeof(CramList) * cram_table_lists);
+    table->lists = (CramList**) cram_alloc(sizeof(CramList*) * cram_table_lists);
 
     for (uint i = 0; i < cram_table_lists; i++)
-    {
-      pthread_rwlock_init(&table->lists[i].lock, NULL);
-      pthread_mutex_init(&table->lists[i].mutex, NULL);
+      table->lists[i] = cram_list_create();
 
-      table->lists[i].index = (CramIndex**) cram_alloc(sizeof(CramIndex*) * cram_index_width(table));
-    }
-
-    table->next = cram_tables;
-    cram_tables = table;
+    cram_list_push(cram_tables, table);
     created = TRUE;
   }
 
-  pthread_mutex_unlock(&cram_tables_mutex);
+  cram_list_close(cram_tables);
 
   if (created)
-  {
     cram_stat_inc(&cram_stats_spinlock, &cram_tables_created);
-  }
 
   return table;
-}
-
-// The indexer thread updates page/blob hash tables for CRAM_COND_EQ.
-
-static void* cram_indexer(void *p)
-{
-  cram_note("indexer started");
-
-  while (!cram_indexer_done)
-  {
-    pthread_spin_lock(&cram_index_events_spinlock);
-    CramIndexEvent *event = cram_index_events;
-    cram_index_events = NULL;
-    pthread_spin_unlock(&cram_index_events_spinlock);
-
-    if (!event)
-      usleep(1000);
-
-    while (event)
-    {
-      CramTable *table = event->table;
-      CramPage *page = event->page;
-      CramList *list = &table->lists[page->list];
-
-      cram_debug("indexer %s %llx", table->name, (ulonglong)page);
-
-      pthread_rwlock_rdlock(&list->lock);
-      pthread_rwlock_wrlock(&page->lock);
-      cram_page_index(event->table, event->page);
-      pthread_rwlock_unlock(&page->lock);
-      pthread_rwlock_unlock(&list->lock);
-
-      CramIndexEvent *next = event->next;
-      cram_free(event);
-      event = next;
-    }
-  }
-
-  cram_note("indexer stopped");
-  return NULL;
-}
-
-static void cram_indexer_start()
-{
-  pthread_create(&cram_indexer_thread, NULL, cram_indexer, NULL);
-}
-
-static void cram_indexer_stop()
-{
-  cram_indexer_done = TRUE;
-  pthread_join(cram_indexer_thread, NULL);
-}
-
-static void cram_schedule_index(CramTable *table, CramPage *page)
-{
-  CramIndexEvent *event = (CramIndexEvent*) cram_alloc(sizeof(CramIndexEvent));
-  event->table = table;
-  event->page = page;
-
-  pthread_spin_lock(&cram_index_events_spinlock);
-  event->next = cram_index_events;
-  cram_index_events = event;
-  pthread_spin_unlock(&cram_index_events_spinlock);
 }
 
 static int cram_table_drop(const char *name)
 {
   int rc = -1;
-
-  pthread_mutex_lock(&cram_tables_mutex);
-  CramTable **table = &cram_tables;
-  while (table && *table && strcmp(name, (*table)->name) != 0)
+  cram_list_open_write(cram_tables);
+  CramTable *t = (CramTable*) cram_list_remove(cram_tables, cram_table_by_name_cb, (void*)name);
+  if (t)
   {
-    table = &((*table)->next);
-  }
-
-  if (table && *table)
-  {
-    CramTable *t = (*table);
-    *table = (*table)->next;
+    cram_debug("dropping %s", name);
     pthread_rwlock_wrlock(&t->lock);
 
     for (uint i = 0; i < cram_table_lists; i++)
     {
-      while (t->lists[i].first)
+      for (CramNode *n = t->lists[i]->first; n; n = n->next)
       {
+        CramPage *p = (CramPage*) n->item;
         for (uint j = 0; j < cram_page_rows; j++)
         {
-          if (t->lists[i].first->rows[j].blobs)
-          {
-            cram_row_free(t, t->lists[i].first, &t->lists[i].first->rows[j], CRAM_NO_LOG);
-          }
+          if (p->rows[j].blobs)
+            cram_row_free(t, p, &p->rows[j], CRAM_NO_LOG);
         }
-        cram_page_free(t, t->lists[i].first);
+        cram_page_free(t, p);
       }
-    }
-
-    for (uint i = 0; i < cram_table_lists; i++)
-    {
-      for (uint j = 0; j < (t->columns * cram_page_rows); j++)
-      {
-        while (t->lists[i].index[j])
-        {
-          CramIndex *drop = t->lists[i].index[j];
-          t->lists[i].index[j] = drop->next;
-          cram_free(drop);
-        }
-      }
-      cram_free(t->lists[i].index);
-      pthread_rwlock_destroy(&t->lists[i].lock);
-      pthread_mutex_destroy(&t->lists[i].mutex);
+      cram_list_free(t->lists[i]);
     }
 
     pthread_rwlock_destroy(&t->lock);
-    pthread_mutex_destroy(&t->mutex);
     cram_free(t->lists);
     cram_free(t->name);
     cram_free(t);
 
     rc = 0;
   }
-  pthread_mutex_unlock(&cram_tables_mutex);
-
+  cram_list_close(cram_tables);
   cram_stat_inc(&cram_stats_spinlock, &cram_tables_deleted);
-
   return rc;
 }
 
 static int cram_table_rename(const char *from, const char *to)
 {
-  pthread_mutex_lock(&cram_tables_mutex);
-  CramTable *table = cram_tables;
-  while (table && strcmp(table->name, from))
-  {
-    table = table->next;
-  }
+  cram_list_open_write(cram_tables);
+  CramTable *table = (CramTable*) cram_list_walk(cram_tables, cram_table_by_name_cb, (void*)from);
   if (table)
   {
+    cram_debug("renaming %s %s", from, to);
     pthread_rwlock_wrlock(&table->lock);
     cram_free(table->name);
     table->name = (char*) cram_alloc(strlen(to)+1);
     strcpy(table->name, to);
     pthread_rwlock_unlock(&table->lock);
   }
-  pthread_mutex_unlock(&cram_tables_mutex);
-
+  cram_list_close(cram_tables);
   cram_stat_inc(&cram_stats_spinlock, &cram_tables_renamed);
   return table ? 0: -1;
 }
 
 static CramTable* cram_table_by_id(uint64 id)
 {
-  CramTable *table = cram_tables;
-  while (table && table->id != id)
-  {
-    table = table->next;
-  }
+  cram_list_open_read(cram_tables);
+  CramTable *table = (CramTable*) cram_list_walk(cram_tables, cram_table_by_id_cb, &id);
+  cram_list_close(cram_tables);
   return table;
 }
 
@@ -865,6 +913,7 @@ static int cram_epoch_create()
 
   if (cram_epoch_file)
   {
+    fflush(cram_epoch_file);
     fclose(cram_epoch_file);
   }
   cram_epoch_file = fopen(name, "ab");
@@ -888,25 +937,12 @@ static void* cram_writer(void *p)
 
   for (;;)
   {
-    pthread_spin_lock(&cram_log_events_spinlock);
-    CramLogEvent *event = cram_log_events;
-    cram_log_events = NULL;
-    pthread_spin_unlock(&cram_log_events_spinlock);
-
-    for (; event && event->next; event = event->next);
-
-    if (!event)
-    {
-      fflush(cram_epoch_file);
-      usleep(1000);
-    }
+    CramLogEvent *event = (CramLogEvent*) cram_queue_accept(cram_write_queue);
 
     if (!event && cram_writer_done)
-    {
       break;
-    }
 
-    while (event)
+    if (event)
     {
       uchar *data  = event->data;
       size_t width = event->width;
@@ -924,6 +960,14 @@ static void* cram_writer(void *p)
       *((uint64*)&buffer[uwidth_offset]) = width;
 
       size_t length;
+      // Client thread precompressed payload?
+      if (cram_precompress_log && event->cdata)
+      {
+        *((uint64*)&buffer[cwidth_offset]) = event->cwidth;
+        memmove(payload, event->cdata, event->cwidth);
+        write_bytes = payload_offset + event->cwidth;
+      }
+      else
       if (cram_compress_log && (length = cram_deflate(payload, width)) && length < width)
       {
         *((uint64*)&buffer[cwidth_offset]) = length;
@@ -961,45 +1005,39 @@ static void* cram_writer(void *p)
 
       pthread_mutex_unlock(&cram_epoch_mutex);
 
-      CramLogEvent *prev = event->prev;
       cram_free(buffer);
+      cram_free(event->cdata);
       cram_free(event->data);
       cram_free(event);
-      event = prev;
 
       cram_stat_inc(&cram_stats_spinlock, &cram_log_writes_completed);
+      cram_queue_bump(cram_write_queue);
     }
   }
 
+  pthread_mutex_lock(&cram_epoch_mutex);
   fflush(cram_epoch_file);
+  pthread_mutex_unlock(&cram_epoch_mutex);
   cram_note("writer stopped");
   return NULL;
 }
 
 static void cram_writer_start()
 {
+  cram_queue_resume(cram_write_queue);
   pthread_create(&cram_writer_thread, NULL, cram_writer, NULL);
 }
 
 static void cram_writer_stop()
 {
   cram_writer_done = TRUE;
+  cram_queue_halt(cram_write_queue);
   pthread_join(cram_writer_thread, NULL);
 }
 
 static void cram_writer_wait()
 {
-  for (;;)
-  {
-    pthread_spin_lock(&cram_stats_spinlock);
-    ulonglong queued = cram_log_writes_queued;
-    ulonglong completed = cram_log_writes_completed;
-    pthread_spin_unlock(&cram_stats_spinlock);
-
-    if (completed == queued)
-      break;
-    usleep(1000);
-  }
+  cram_queue_wait(cram_write_queue);
 }
 
 // Send a log entry to the writer thread. This function does not
@@ -1014,11 +1052,24 @@ static int cram_log_entry(uchar *data, size_t width)
   memmove(event->data, data, width);
   event->width = width;
 
-  pthread_spin_lock(&cram_log_events_spinlock);
-  event->next = cram_log_events;
-  cram_log_events = event;
-  if (event->next) event->next->prev = event;
-  pthread_spin_unlock(&cram_log_events_spinlock);
+  if (cram_precompress_log)
+  {
+    uchar *payload = (uchar*) cram_alloc(width);
+    memmove(payload, data, width);
+
+    size_t length;
+    if (cram_compress_log && (length = cram_deflate(payload, width)) && length < width)
+    {
+      event->cwidth = length;
+      event->cdata  = payload;
+    }
+    else
+    {
+      cram_free(payload);
+    }
+  }
+
+  cram_queue_submit(cram_write_queue, event);
 
   cram_stat_inc(&cram_stats_spinlock, &cram_log_writes_queued);
 
@@ -1259,16 +1310,14 @@ static int cram_init_insert(uchar *data)
       length = *((uchar*)data);
       data += sizeof(uchar);
       used += sizeof(uchar);
-
-      blobs[column] = cram_incref(data, length);
+      blobs[column] = cram_blob_inc(data, length);
     }
     else
     {
       length = *((uint32*)data);
       data += sizeof(uint32);
       used += sizeof(uint32);
-
-      blobs[column] = cram_incref(data, length);
+      blobs[column] = cram_blob_inc(data, length);
     }
     data += length;
     used += length;
@@ -1324,19 +1373,18 @@ static int cram_init_delete(uchar *data)
   CramRow *row = NULL;
   for (uint i = 0; !page && i < cram_table_lists; i++)
   {
-    CramPage *list = table->lists[i].first;
-    while (list && !page)
+    for (CramNode *n = table->lists[i]->first; !page && n; n = n->next)
     {
+      CramPage *p = (CramPage*) n->item;
       for (uint j = 0; j < cram_page_rows; j++)
       {
-        if (list->rows[j].id == id)
+        if (p->rows[j].id == id && p->rows[j].blobs)
         {
-          page = list;
+          page = p;
           row = &page->rows[j];
           break;
         }
       }
-      list = list->next;
     }
   }
   if (page)
@@ -1345,29 +1393,6 @@ static int cram_init_delete(uchar *data)
   }
 
   return 0;
-}
-
-static void cram_job_queue(CramJob *job)
-{
-  pthread_mutex_lock(&cram_job_mutex);
-
-  cram_debug("... queue job %s", job->table->name);
-
-  CramJob *prev = cram_job;
-  while (prev && prev->next)
-  {
-    prev = prev->next;
-  }
-  if (prev)
-  {
-    prev->next = job;
-  }
-  else
-  {
-    cram_job = job;
-  }
-  pthread_cond_signal(&cram_job_cond);
-  pthread_mutex_unlock(&cram_job_mutex);
 }
 
 static CramJob* cram_job_create(CramTable *table, CramCondition *condition, uint position)
@@ -1382,7 +1407,7 @@ static CramJob* cram_job_create(CramTable *table, CramCondition *condition, uint
   pthread_mutex_init(&job->mutex, NULL);
   pthread_cond_init(&job->cond, NULL);
 
-  cram_job_queue(job);
+  cram_queue_submit(cram_job_queue, job);
 
   return job;
 }
@@ -1513,12 +1538,10 @@ static bool cram_job_row(CramJob *job, CramPage *page, CramRow *row)
 {
   CramCondition *con = job->condition;
 
-  if (!row->blobs)
-  {
-    return FALSE;
-  }
-
   job->steps++;
+
+  if (!row->blobs)
+    return FALSE;
 
   bool match = TRUE;
 
@@ -1563,43 +1586,17 @@ static void cram_job_execute(uint id, CramJob *job)
 
   pthread_rwlock_rdlock(&table->lock);
 
-  CramList *list = &table->lists[job->list];
+  CramList *list = table->lists[job->list];
 
-  pthread_rwlock_rdlock(&list->lock);
+  cram_list_open_read(list);
 
-  if (cram_indexing && job->condition && job->condition->type == CRAM_COND_EQ
-    && job->condition->blobs[0])
-  {
-    cram_debug("worker %u using index", id);
+  for (CramNode *node = list->first; node && !job->complete; node = node->next)
+    cram_job_page(job, (CramPage*)node->item);
 
-    CramBlob *blob = job->condition->blobs[0];
-    uint32 hash  = cram_hash_calc(blob->buffer, blob->length);
-    uint chain = hash % cram_index_width(job->table);
-
-    pthread_mutex_lock(&list->mutex);
-    CramIndex *idx = list->index[chain];
-    pthread_mutex_unlock(&list->mutex);
-
-    for (; idx && !job->complete; idx = idx->next)
-    {
-      cram_job_page(job, idx->page);
-    }
-  }
-  else
-  {
-    pthread_mutex_lock(&list->mutex);
-    CramPage *page = list->first;
-    pthread_mutex_unlock(&list->mutex);
-
-    for (; page && !job->complete; page = page->next)
-    {
-      cram_job_page(job, page);
-    }
-  }
+  cram_list_close(list);
 
   job->complete = TRUE;
 
-  pthread_rwlock_unlock(&list->lock);
   pthread_rwlock_unlock(&table->lock);
 
   cram_debug("%u worker matches %llu steps %llu", id, job->matches, job->steps);
@@ -1612,37 +1609,30 @@ static void* cram_worker(void *p)
   CramWorker *self = (CramWorker*) p;
   uint id = self - cram_workers;
 
-  pthread_mutex_lock(&cram_job_mutex);
   cram_note("%u worker started", id);
   while (self->run)
   {
-    if (!cram_job)
+    CramJob *job = (CramJob*) cram_queue_accept(cram_job_queue);
+
+    if (job)
     {
-      cram_debug("%u worker wait", id);
-      pthread_cond_wait(&cram_job_cond, &cram_job_mutex);
-      cram_debug("%u worker awoke", id);
-    }
-    if (cram_job)
-    {
-      CramJob *job = cram_job;
-      cram_job = job->next;
       pthread_mutex_lock(&job->mutex);
-      pthread_mutex_unlock(&cram_job_mutex);
       cram_debug("%u working job %s", id, job->table->name);
       cram_job_execute(id, job);
       pthread_cond_signal(&job->cond);
       pthread_mutex_unlock(&job->mutex);
-      pthread_mutex_lock(&cram_job_mutex);
+      cram_queue_bump(cram_job_queue);
     }
   }
   self->done = TRUE;
-  pthread_mutex_unlock(&cram_job_mutex);
   cram_note("%u worker stopped", id);
   return NULL;
 }
 
 static void cram_workers_start()
 {
+  cram_queue_resume(cram_job_queue);
+
   cram_workers = (CramWorker*) cram_alloc(sizeof(CramWorker) * cram_worker_threads);
 
   for (uint i = 0; i < cram_worker_threads; i++)
@@ -1655,20 +1645,12 @@ static void cram_workers_start()
 static void cram_workers_stop()
 {
   for (uint i = 0; i < cram_worker_threads; i++)
-  {
     cram_workers[i].run = FALSE;
-  }
+
+  cram_queue_halt(cram_job_queue);
+
   for (uint i = 0; i < cram_worker_threads; i++)
-  {
-    while (!cram_workers[i].done)
-    {
-      pthread_mutex_lock(&cram_job_mutex);
-      pthread_cond_signal(&cram_job_cond);
-      pthread_mutex_unlock(&cram_job_mutex);
-      usleep(1000);
-    }
     pthread_join(cram_workers[i].thread, NULL);
-  }
 
   cram_free(cram_workers);
 }
@@ -1677,15 +1659,15 @@ static void* cram_consolidator(void *p)
 {
   CramConsolidateJob *job = (CramConsolidateJob*)p;
 
-  CramPage *page = job->table->lists[job->list].first;
-  while (page)
+  for (CramNode *n = job->table->lists[job->list]->first; n; n = n->next)
   {
+    CramPage *page = (CramPage*) n->item;
     for (uint j = 0; j < cram_page_rows; j++)
     {
       if (page->rows[j].blobs)
         cram_log_insert(job->table, &page->rows[j]);
     }
-    page = page->next;
+    cram_writer_wait();
   }
 
   pthread_mutex_lock(&job->mutex);
@@ -1713,14 +1695,17 @@ static void cram_consolidate()
   cram_epoch = 1;
   cram_epoch_file = NULL;
   cram_flush_level = 0;
+  if (cram_compress_log) cram_precompress_log = 1;
   cram_epoch_create();
   pthread_mutex_unlock(&cram_epoch_mutex);
 
-  CramTable *table = cram_tables;
-  while (table)
+  cram_list_open_read(cram_tables);
+
+  CramNode *node = cram_tables->first;
+  while (node)
   {
-    cram_log_create(table);
-    table = table->next;
+    cram_log_create((CramTable*)node->item);
+    node = node->next;
   }
   cram_writer_wait();
 
@@ -1728,9 +1713,10 @@ static void cram_consolidate()
   cram_epoch_create();
   pthread_mutex_unlock(&cram_epoch_mutex);
 
-  table = cram_tables;
-  while (table)
+  node = cram_tables->first;
+  while (node)
   {
+    CramTable *table = (CramTable*) node->item;
     cram_note("%s", table->name);
 
     CramConsolidateJob jobs[cram_table_lists];
@@ -1760,8 +1746,11 @@ static void cram_consolidate()
         }
       }
     }
-    table = table->next;
+    cram_writer_wait();
+    node = node->next;
   }
+
+  cram_list_close(cram_tables);
   cram_writer_wait();
 
   uchar ok = 1;
@@ -1856,29 +1845,16 @@ static int cram_init_func(void *p)
 
   thr_lock_init(&mysql_lock);
 
-  cram_hash.mutexes  = (pthread_mutex_t*) cram_alloc(sizeof(pthread_mutex_t) * cram_hash_locks);
-  cram_hash.chains = (CramBlob**) cram_alloc(sizeof(CramBlob*) * cram_hash_chains);
-
-  for (uint i = 0; i < cram_hash_locks; i++)
-    pthread_mutex_init(&cram_hash.mutexes[i], NULL);
-
-  pthread_mutex_init(&cram_tables_mutex, NULL);
   pthread_spin_init(&cram_sequence_spinlock, PTHREAD_PROCESS_PRIVATE);
   pthread_mutex_init(&cram_epoch_mutex, NULL);
-  pthread_spin_init(&cram_log_events_spinlock, PTHREAD_PROCESS_PRIVATE);
-  pthread_spin_init(&cram_index_events_spinlock, PTHREAD_PROCESS_PRIVATE);
   pthread_spin_init(&cram_stats_spinlock, PTHREAD_PROCESS_PRIVATE);
+
+  cram_job_queue = cram_queue_create(CRAM_QUEUE);
+  cram_write_queue = cram_queue_create(CRAM_QUEUE);
+  cram_hash = cram_hash_create(cram_hash_chains, cram_hash_locks);
+  cram_tables = cram_list_create();
+
   cram_note("Time to cram!");
-
-  pthread_mutex_init(&cram_job_mutex, NULL);
-  pthread_cond_init(&cram_job_cond, NULL);
-
-  for (uint i = 0; i < CRAM_UINTS; i++)
-  {
-    cram_hash_uints[i].length = sizeof(uint64);
-    cram_hash_uints[i].buffer = (uchar*) &cram_hash_uint_bufs[i];
-    cram_hash_uint_bufs[i] = i;
-  }
 
   bool clean_shutdown = FALSE;
 
@@ -1979,11 +1955,11 @@ static int cram_init_func(void *p)
       }
     }
   }
+  remove("cram");
 
   cram_epoch_file = NULL;
   cram_epoch_create();
   cram_writer_start();
-  cram_indexer_start();
   cram_workers_start();
 
   return 0;
@@ -1992,21 +1968,17 @@ static int cram_init_func(void *p)
 static int cram_done_func(void *p)
 {
   cram_workers_stop();
-  cram_indexer_stop();
   cram_consolidate();
   cram_writer_stop();
 
-  for (uint i = 0; i < cram_hash_locks; i++)
-    pthread_mutex_destroy(&cram_hash.mutexes[i]);
+  cram_queue_free(cram_job_queue);
+  cram_queue_free(cram_write_queue);
+  cram_hash_free(cram_hash);
+  cram_list_free(cram_tables);
 
-  pthread_mutex_destroy(&cram_tables_mutex);
   pthread_spin_destroy(&cram_sequence_spinlock);
   pthread_mutex_destroy(&cram_epoch_mutex);
-  pthread_spin_destroy(&cram_log_events_spinlock);
   pthread_spin_destroy(&cram_stats_spinlock);
-  pthread_mutex_destroy(&cram_job_mutex);
-
-  pthread_cond_destroy(&cram_job_cond);
 
   return 0;
 }
@@ -2167,8 +2139,6 @@ int ha_cram::update_row(const uchar *old_data, uchar *new_data)
 
     cram_log_delete(cram_table, cram_result->row->id);
     cram_log_insert(cram_table, cram_result->row);
-    cram_row_index(cram_table, cram_result->page, cram_result->row->blobs);
-    cram_page_changed(cram_table, cram_result->page);
 
     rc = 0;
   }
@@ -2199,6 +2169,8 @@ int ha_cram::rnd_init(bool scan)
 
 void ha_cram::rnd_map()
 {
+  cram_debug("%s", __func__);
+
   // Equality. If no blob was found in the data dictionary then nothing can possibly equal it.
   if (cram_condition && cram_condition->type == CRAM_COND_EQ && !cram_condition->blobs[0])
     return;
@@ -2207,6 +2179,7 @@ void ha_cram::rnd_map()
 
   for (uint i = 0; i < cram_table_lists; i++)
   {
+    cram_debug("job %u create", i);
     jobs[i] = cram_job_create(cram_table, cram_condition, i);
   }
 
@@ -2306,9 +2279,9 @@ int ha_cram::info(uint flag)
     uint64 rows = 0;
     for (uint i = 0; i < cram_table_lists; i++)
     {
-      pthread_mutex_lock(&cram_table->lists[i].mutex);
-      rows += cram_table->lists[i].rows;
-      pthread_mutex_unlock(&cram_table->lists[i].mutex);
+      cram_list_open_read(cram_table->lists[i]);
+      rows += cram_table->lists[i]->length * cram_page_rows;
+      cram_list_close(cram_table->lists[i]);
     }
 
     cram_debug("... HA_STATUS_VARIABLE");
@@ -2328,6 +2301,11 @@ int ha_cram::reset()
 
   while (cram_condition)
   {
+    for (uint i = 0; i < cram_condition->count; i++)
+    {
+      if (cram_condition->blobs && cram_condition->blobs[i])
+        cram_blob_dec(cram_condition->blobs[i]->buffer, cram_condition->blobs[i]->length);
+    }
     cram_free(cram_condition->buffer);
     cram_free(cram_condition->like);
     cram_free(cram_condition->blobs);
@@ -2382,11 +2360,12 @@ int ha_cram::rename_table(const char *from, const char *to)
 int ha_cram::create(const char *name, TABLE *table_arg, HA_CREATE_INFO *create_info)
 {
   cram_debug("%s %s", __func__, name);
+  CramTable *table = NULL;
 
-  if ((cram_table = cram_table_open(name, table_arg->s->fields, 0)))
-    cram_log_create(cram_table);
+  if ((table = cram_table_open(name, table_arg->s->fields, 0)))
+    cram_log_create(table);
 
-  return cram_table ? 0: -1;
+  return table ? 0: -1;
 }
 
 bool ha_cram::check_if_incompatible_data(HA_CREATE_INFO *info, uint table_changes)
@@ -2454,13 +2433,13 @@ static CramCondition* check_condition(const COND *cond)
         {
           int64 n = arg->val_int();
           cram_debug("... int %lld", n);
-          cc->blobs[0] = cram_get((uchar*)(&n), sizeof(int64));
+          cc->blobs[0] = cram_blob_get((uchar*)(&n), sizeof(int64));
         }
         else
         {
           str = arg->val_str(&tmp);
           cram_debug("... str %s", str->c_ptr());
-          cc->blobs[0] = cram_get((uchar*)str->ptr(), str->length());
+          cc->blobs[0] = cram_blob_get((uchar*)str->ptr(), str->length());
         }
       }
 
@@ -2580,7 +2559,7 @@ static CramCondition* check_condition(const COND *cond)
           cc->index = ff->field->field_index;
 
           cc->blobs = (CramBlob**) cram_alloc(sizeof(CramBlob*) * cc->count);
-          cc->blobs[0] = cram_get((uchar*)str->ptr(), str->length());
+          cc->blobs[0] = cram_blob_get((uchar*)str->ptr(), str->length());
         }
       }
     }
@@ -2615,13 +2594,13 @@ static CramCondition* check_condition(const COND *cond)
           {
             int64 n = arg->val_int();
             cram_debug("... int %lld", n);
-            cc->blobs[i-1] = cram_get((uchar*)(&n), sizeof(int64));
+            cc->blobs[i-1] = cram_blob_get((uchar*)(&n), sizeof(int64));
           }
           else
           {
             str = arg->val_str(&tmp);
             cram_debug("... str %s", str->c_ptr());
-            cc->blobs[i-1] = cram_get((uchar*)str->ptr(), str->length());
+            cc->blobs[i-1] = cram_blob_get((uchar*)str->ptr(), str->length());
           }
         }
       }
