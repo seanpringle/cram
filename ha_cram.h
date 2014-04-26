@@ -36,6 +36,7 @@
 #define CRAM_UINTS 1000
 #define CRAM_CACHE 3
 #define CRAM_QUEUE 1024
+#define CRAM_WEIGHT 1
 
 #define CRAM_LOG TRUE
 #define CRAM_NO_LOG FALSE
@@ -46,6 +47,8 @@
 typedef bool (*CramEqual)(void*, void*);
 typedef void* (*CramCreate)(void*, void*);
 typedef void (*CramDestroy)(void*, void*);
+
+typedef uchar* CramBitMap;
 
 typedef struct _CramQueue {
   bool halt;
@@ -83,6 +86,7 @@ enum {
 };
 
 typedef struct _CramBlob {
+  uint32 hashval;
   uint32 length;
   uchar *buffer;
 } CramBlob;
@@ -95,8 +99,10 @@ typedef struct _CramRow {
 typedef struct _CramPage {
   pthread_rwlock_t lock;
   uint32 count;
+  uint32 changes;
   CramList *list;
   CramRow *rows;
+  CramBitMap bitmap;
 } CramPage;
 
 typedef struct _CramTable {
@@ -105,6 +111,8 @@ typedef struct _CramTable {
   uint64 id;
   uint32 columns;
   CramList **lists;
+  CramHash **indexes;
+  uint index_width;
 } CramTable;
 
 typedef struct _CramLogEvent {
@@ -113,6 +121,12 @@ typedef struct _CramLogEvent {
   uchar *cdata;
   size_t cwidth;
 } CramLogEvent;
+
+typedef struct _CramIndexEvent {
+  CramTable *table;
+  CramPage *page;
+  CramRow *row;
+} CramIndexEvent;
 
 enum {
   CRAM_COND_EQ=1,
@@ -157,7 +171,7 @@ typedef struct _CramJob {
   CramResult *result;
   bool complete;
   uint list;
-  uint64 steps, matches;
+  uint64 pages, rows, matches;
   CramCondition *condition;
   pthread_mutex_t mutex;
   pthread_cond_t cond;
