@@ -342,6 +342,11 @@ static void cram_list_shunt(CramList *list, void *item)
   node->item = item;
 }
 
+static bool cram_list_eq(void *item, void *context)
+{
+  return item == context;
+}
+
 static void* cram_list_remove(CramList *list, CramEqual equal, void *context)
 {
   void *item = NULL;
@@ -363,6 +368,23 @@ static void* cram_list_walk(CramList *list, CramEqual equal, void *context)
   while (node && !equal(node->item, context))
     node = node->next;
   return node ? node->item: NULL;
+}
+
+static void cram_list_join(CramList *listA, CramList *listB)
+{
+  if (listA->first && listB->first)
+  {
+    listA->last->next = listB->first;
+    listA->last = listB->last;
+  }
+  else
+  if (listB->first)
+  {
+    listA->first = listB->first;
+    listA->last  = listB->last;
+  }
+  listB->first = NULL;
+  listB->last  = NULL;
 }
 
 static void cram_hash_init(CramHash *hash, size_t width, size_t locks)
@@ -1541,7 +1563,7 @@ static CramJob* cram_job_create(CramTable *table, CramCondition *condition, uint
   CramJob *job = (CramJob*) cram_alloc(sizeof(CramJob));
 
   job->table     = table;
-  job->result    = NULL;
+  job->results   = cram_list_create();
   job->list      = position;
   job->condition = condition;
 
@@ -1555,6 +1577,7 @@ static void cram_job_free(CramJob *job)
 {
   pthread_mutex_destroy(&job->mutex);
   pthread_cond_destroy(&job->cond);
+  cram_list_free(job->results);
   cram_free(job);
 }
 
@@ -1698,8 +1721,7 @@ static bool cram_job_row(CramJob *job, CramPage *page, CramRow *row)
     CramResult *res = (CramResult*) cram_alloc(sizeof(CramResult));
     res->row = row;
     res->page = page;
-    res->next = job->result;
-    job->result = res;
+    cram_list_push(job->results, res);
     job->matches++;
   }
   return match;
@@ -2171,12 +2193,9 @@ ha_cram::ha_cram(handlerton *hton, TABLE_SHARE *table_arg)
 int ha_cram::record_store(uchar *buf)
 {
   if (!cram_result)
-  {
     return HA_ERR_END_OF_FILE;
-  }
 
   pthread_rwlock_rdlock(&cram_result->page->lock);
-
   CramRow *row = cram_result->row;
 
   if (!row->blobs)
@@ -2212,11 +2231,8 @@ int ha_cram::record_store(uchar *buf)
       }
     }
   }
-
   dbug_tmp_restore_column_map(table->write_set, org_bitmap);
-
   pthread_rwlock_unlock(&cram_result->page->lock);
-
   return 0;
 }
 
@@ -2241,6 +2257,7 @@ int ha_cram::open(const char *name, int mode, uint test_if_locked)
   thr_lock_data_init(&mysql_lock, &lock, NULL);
   cram_condition = NULL;
   cram_result = NULL;
+  cram_rnd_node = NULL;
   cram_rnd_results = NULL;
   cram_pos_results = NULL;
   counter_insert = 0;
@@ -2273,9 +2290,7 @@ int ha_cram::write_row(uchar *buf)
   }
 
   dbug_tmp_restore_column_map(table->read_set, org_bitmap);
-
   cram_row_create(cram_table, 0, blobs, CRAM_LOG, CRAM_INSERT);
-
   counter_insert++;
   return 0;
 }
@@ -2311,11 +2326,8 @@ int ha_cram::update_row(const uchar *old_data, uchar *new_data)
 
     rc = 0;
   }
-
   pthread_rwlock_unlock(&cram_result->page->lock);
-
   cram_row_index(cram_table, cram_result->page, cram_result->row);
-
   counter_update++;
   return rc;
 }
@@ -2329,18 +2341,17 @@ int ha_cram::delete_row(const uchar *buf)
 int ha_cram::rnd_init(bool scan)
 {
   cram_debug("%s", __func__);
-
   // rnd_init can be called multiple times followed by a single explicit rnd_end
   rnd_end();
-
   cram_rnd_started = FALSE;
-
+  cram_rnd_node = NULL;
   return 0;
 }
 
 void ha_cram::rnd_map()
 {
   cram_debug("%s", __func__);
+  cram_rnd_results = cram_list_create();
 
   // Equality. If no blob was found in the data dictionary then nothing can possibly equal it.
   if (cram_condition && cram_condition->type == CRAM_COND_EQ && !cram_condition->blobs[0])
@@ -2357,76 +2368,60 @@ void ha_cram::rnd_map()
   for (uint i = 0; i < cram_table_lists; i++)
   {
     CramJob *job = jobs[i];
-
     pthread_mutex_lock(&job->mutex);
     if (!job->complete)
-    {
       pthread_cond_wait(&job->cond, &job->mutex);
-    }
-
     cram_debug("job %u done", i);
-
-    CramResult *res = job->result;
-    while (res && res->next)
-    {
-      res = res->next;
-    }
-    if (res)
-    {
-      res->next = cram_result;
-    }
-    if (job->result)
-    {
-      cram_result = job->result;
-    }
-
+    cram_list_join(cram_rnd_results, job->results);
     pthread_mutex_unlock(&job->mutex);
     cram_job_free(job);
   }
-
-  cram_rnd_results = cram_result;
 }
 
 int ha_cram::rnd_end()
 {
   cram_debug("%s", __func__);
-
-  cram_result = cram_rnd_results;
-  while (cram_result)
+  if (cram_rnd_results)
   {
-    CramResult *next = cram_result->next;
-    cram_free(cram_result);
-    cram_result = next;
+    while (cram_rnd_results->first)
+      cram_free(cram_list_remove(cram_rnd_results, cram_list_eq, cram_rnd_results->first->item));
+    cram_list_free(cram_rnd_results);
+    cram_rnd_results = NULL;
   }
-  cram_rnd_results = NULL;
-
+  cram_rnd_node = NULL;
   return 0;
 }
 
 int ha_cram::rnd_next(uchar *buf)
 {
   counter_rnd_next++;
+
   if (!cram_rnd_started)
   {
     rnd_map();
-    cram_result = cram_rnd_results;
+    cram_rnd_node = cram_rnd_results->first;
     cram_rnd_started = TRUE;
   }
   else
-  if (cram_result)
+  if (cram_rnd_node)
   {
-    cram_result = cram_result->next;
+    cram_rnd_node = cram_rnd_node->next;
   }
+
+  cram_result = (CramResult*) (cram_rnd_node ? cram_rnd_node->item: NULL);
+
   return record_store(buf);
 }
 
 void ha_cram::position(const uchar *record)
 {
+  if (!cram_pos_results)
+    cram_pos_results = cram_list_create();
+
   CramResult *res = (CramResult*) cram_alloc(sizeof(CramResult));
   memmove(res, cram_result, sizeof(CramResult));
 
-  res->next = cram_pos_results;
-  cram_pos_results = res;
+  cram_list_push(cram_pos_results, res);
 
   *((CramResult**)ref) = res;
   ref_length = sizeof(CramResult*);
@@ -2489,14 +2484,13 @@ int ha_cram::reset()
 
 int ha_cram::external_lock(THD *thd, int lock_type)
 {
-  cram_result = cram_pos_results;
-  while (cram_result)
+  if (cram_pos_results)
   {
-    CramResult *next = cram_result->next;
-    cram_free(cram_result);
-    cram_result = next;
+    while (cram_pos_results->first)
+      cram_free(cram_list_remove(cram_pos_results, cram_list_eq, cram_pos_results->first->item));
+    cram_list_free(cram_pos_results);
+    cram_pos_results = NULL;
   }
-  cram_pos_results = NULL;
 
   counter_insert = 0;
   counter_update = 0;

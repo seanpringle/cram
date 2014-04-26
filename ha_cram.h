@@ -163,12 +163,11 @@ typedef struct _CramCondition {
 typedef struct _CramResult {
   CramPage *page;
   CramRow *row;
-  struct _CramResult *next;
 } CramResult;
 
 typedef struct _CramJob {
   CramTable *table;
-  CramResult *result;
+  CramList *results;
   bool complete;
   uint list;
   uint64 pages, rows, matches;
@@ -207,7 +206,9 @@ typedef struct _CramLoadJob {
 class ha_cram: public handler
 {
   CramTable *cram_table;
-  CramResult *cram_rnd_results, *cram_result, *cram_pos_results;
+  CramList *cram_rnd_results, *cram_pos_results;
+  CramNode *cram_rnd_node;
+  CramResult *cram_result;
   CramCondition *cram_condition;
   bool cram_rnd_started;
   THR_LOCK_DATA lock;
