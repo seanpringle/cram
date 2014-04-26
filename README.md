@@ -15,7 +15,7 @@ An experimental storage engine for MariaDB 10 intended for OLAP.
 
 Default: 0
 
-Use huffman compression for log entries.
+Use huffman encoding for log entries.
 
 #### cram_flush_level = N
 
@@ -33,25 +33,25 @@ Whether to continue if log corruption is found during startup. If this is used t
 
 Default: 1000000
 
-Width of the blob hash-table. Wider means faster at the cost of memory. Ideally proprotional to the number of unique values in the data set.
+Width of the global blob hash-table that stores all values and reference counts. Wider means faster at the cost of memory.
 
 #### cram_hash_locks = N
 
 Default: 1000
 
-Width of the blob hash-table locks array. Does not make sense to exceed 1:1 ratio with cram_hash_chains.
+Width of the global blob locks-array that controls access to hash chains. Does not make sense to exceed 1:1 ratio with cram_hash_chains.
 
 #### cram_index_queue_size = N
 
 Default: 1000
 
-Page-level indexes need to be updated immediately on INSERT and UPDATE for new field values, but can be lazy for DELETE and purging old field values. Once a page hits 25% of rows changed, lazy reindexing is scheduled via a background *indexer thread*. Limiting the size of the index event queue is useful if heavy write activity causes index lag.
+Page-level indexes need to be updated immediately on INSERT and UPDATE with new field values, but can be lazy for DELETE and purging old field values. Once a page hits 25% of rows changed, lazy reindexing is scheduled via a background *indexer thread*. Limiting the size of the index event queue is useful if heavy write activity causes index lag.
 
 #### cram_index_weight = N
 
 Default: 1
 
-Page-level indexes determine whether a blob is referenced somewhere on a page, but not the specific row or field. The width of a table's index is calculated like this:
+Page-level indexes determine whether a blob is referenced somewhere on a page but not the specific row or field. The width of a table's index is calculated like this:
 
     width = cram_page_rows * columns * cram_index_weight
 
@@ -61,7 +61,7 @@ A larger weight means a wider index and faster lookups at the cost of memory.
 
 Default: 1000
 
-The background worker threads process mapping jobs on behalf of the MariaDB clients. Each query generates *cram_table_lists* jobs. Increasing the job queue size won't make jobs get processed faster but it can reduce thread context switches.
+The background worker threads process mapping jobs on behalf of MariaDB client threads. Each query generates N=*cram_table_lists* jobs. Increasing the job queue size generally won't process jobs faster but it can reduce context switches.
 
 #### cram_loader_threads = N
 
@@ -77,9 +77,9 @@ Number of rows per page defines the locking granularity.
 
 #### cram_strict_write = 1|0
 
-Default: 0
+Default: 1
 
-Whether to abort on disk write failure. Since the data set is in memory it's possible to keep running during a storage failure, allowing time to dump data elsewhere. Obviously only useful if mysqld itself stays alive.
+Whether to continue or abort on disk write failure. Since the data set is in memory it's possible to keep running during a storage failure, allowing time to dump data elsewhere. Obviously only useful if mysqld itself stays alive.
 
 #### cram_table_lists = N
 
