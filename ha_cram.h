@@ -31,12 +31,12 @@
 #define CRAM_LOADERS 4
 #define CRAM_LISTS 4
 #define CRAM_EPOCH 1000000000
-#define CRAM_PAGE 128
+#define CRAM_PAGE 100
 #define CRAM_FILE "cram%08llx"
 #define CRAM_UINTS 1000
 #define CRAM_CACHE 3
-#define CRAM_QUEUE 1024
-#define CRAM_WEIGHT 1
+#define CRAM_QUEUE 1000
+#define CRAM_WEIGHT 4
 
 #define CRAM_LOG TRUE
 #define CRAM_NO_LOG FALSE
@@ -50,9 +50,15 @@ typedef void (*CramDestroy)(void*, void*);
 
 typedef uchar* CramBitMap;
 
+typedef struct _CramString {
+  uchar *buffer;
+  size_t length;
+  size_t limit;
+} CramString;
+
 typedef struct _CramQueue {
   bool halt;
-  uint64 total, count, complete;
+  uint64 total, count, complete, stalls;
   pthread_mutex_t mutex;
   pthread_cond_t read_cond, write_cond, wait_cond;
   size_t width, read, write;
@@ -103,6 +109,7 @@ typedef struct _CramPage {
   CramList *list;
   CramRow *rows;
   CramBitMap bitmap;
+  bool queued;
 } CramPage;
 
 typedef struct _CramTable {
@@ -125,7 +132,6 @@ typedef struct _CramLogEvent {
 typedef struct _CramIndexEvent {
   CramTable *table;
   CramPage *page;
-  CramRow *row;
 } CramIndexEvent;
 
 enum {
@@ -174,7 +180,6 @@ typedef struct _CramJob {
   CramCondition *condition;
   pthread_mutex_t mutex;
   pthread_cond_t cond;
-  struct _CramJob *next;
 } CramJob;
 
 typedef struct _CramWorker {
@@ -212,6 +217,8 @@ class ha_cram: public handler
   CramCondition *cram_condition;
   bool cram_rnd_started;
   THR_LOCK_DATA lock;
+  uint active_index;
+  bool bulk_insert;
 
   uint64 counter_insert;
   uint64 counter_update;
@@ -233,10 +240,12 @@ public:
   {
     return (
         HA_NO_TRANSACTIONS
+      | HA_NO_AUTO_INCREMENT
       | HA_REC_NOT_IN_SEQ
       | HA_PARTIAL_COLUMN_READ
       | HA_BINLOG_ROW_CAPABLE
       | HA_BINLOG_STMT_CAPABLE
+      | HA_DO_INDEX_COND_PUSHDOWN
       | HA_MUST_USE_TABLE_CONDITION_PUSHDOWN
     );
   }
@@ -247,9 +256,9 @@ public:
   }
 
   uint max_supported_record_length() const { return HA_MAX_REC_LENGTH; }
-  uint max_supported_keys()          const { return 0; }
-  uint max_supported_key_parts()     const { return 0; }
-  uint max_supported_key_length()    const { return 0; }
+  uint max_supported_keys()          const { return 1; }
+  uint max_supported_key_parts()     const { return 1; }
+  uint max_supported_key_length()    const { return UINT_MAX; }
   virtual double scan_time() { return (double) DBL_MIN; }
   virtual double read_time(uint, uint, ha_rows rows) { return (double) DBL_MAX/2; }
   int open(const char *name, int mode, uint test_if_locked);    // required
@@ -262,6 +271,9 @@ public:
   int rnd_end();
   int rnd_next(uchar *buf);                                     ///< required
   int rnd_pos(uchar *buf, uchar *pos);                          ///< required
+  int index_init(uint idx, bool sorted);
+  int index_read(uchar * buf, const uchar * key, uint key_len, enum ha_rkey_function find_flag);
+  int index_end();
   void position(const uchar *record);                           ///< required
   int info(uint);                                               ///< required
   int reset();
@@ -272,6 +284,7 @@ public:
   bool check_if_incompatible_data(HA_CREATE_INFO *info, uint table_changes);
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lock_type lock_type);     ///< required
   const COND * cond_push ( const COND * cond );
-
-  int record_store(uchar *buf);
+  void start_bulk_insert(ha_rows rows, uint flags);
+  int end_bulk_insert();
+  int record_store(uchar *buf, CramResult *result);
 };
