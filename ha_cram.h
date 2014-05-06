@@ -1,5 +1,4 @@
-/*
-  Copyright (c) 2004, 2010, Oracle and/or its affiliates
+/* Copyright (c) 2014 Sean Pringle sean.pringle@gmail.com
 
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -32,9 +31,7 @@
 #define CRAM_LISTS 4
 #define CRAM_EPOCH 1000000000
 #define CRAM_PAGE 100
-#define CRAM_FILE "cram%08llx"
-#define CRAM_UINTS 1000
-#define CRAM_CACHE 3
+#define CRAM_FILE "cram%06llx"
 #define CRAM_QUEUE 1000
 #define CRAM_WEIGHT 4
 
@@ -71,11 +68,11 @@ typedef struct _CramNode {
   struct _CramNode *next;
 } CramNode;
 
-typedef struct _CramHash {
+typedef struct _CramDict {
   size_t width, locks;
   CramNode **chains;
   pthread_rwlock_t *rwlocks;
-} CramHash;
+} CramDict;
 
 typedef struct _CramList {
   size_t length;
@@ -98,16 +95,19 @@ typedef struct _CramBlob {
 } CramBlob;
 
 typedef struct _CramRow {
-  uint64 id;
+  union {
+    uint64 id;
+    struct _CramRow *next;
+  };
   CramBlob **blobs;
 } CramRow;
 
 typedef struct _CramPage {
   pthread_rwlock_t lock;
-  uint32 count;
+  uint16 count;
   uint32 changes;
   CramList *list;
-  CramRow *rows;
+  CramRow *rows, *row_free;
   CramBitMap bitmap;
   bool queued;
 } CramPage;
@@ -118,7 +118,8 @@ typedef struct _CramTable {
   uint64 id;
   uint32 columns;
   CramList **lists;
-  CramHash **indexes;
+  CramDict **indexes;
+  uint opened;
   uint index_width;
 } CramTable;
 
@@ -129,10 +130,10 @@ typedef struct _CramLogEvent {
   size_t cwidth;
 } CramLogEvent;
 
-typedef struct _CramIndexEvent {
+typedef struct _CramCheckEvent {
   CramTable *table;
   CramPage *page;
-} CramIndexEvent;
+} CramCheckEvent;
 
 enum {
   CRAM_COND_EQ=1,
@@ -219,6 +220,7 @@ class ha_cram: public handler
   THR_LOCK_DATA lock;
   uint active_index;
   bool bulk_insert;
+  char status_msg[256];
 
   uint64 counter_insert;
   uint64 counter_update;
@@ -287,4 +289,5 @@ public:
   void start_bulk_insert(ha_rows rows, uint flags);
   int end_bulk_insert();
   int record_store(uchar *buf, CramResult *result);
+  void update_state(const char *format, ...);
 };
