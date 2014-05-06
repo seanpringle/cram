@@ -24,16 +24,16 @@
 #include <probes_mysql.h>
 #include "thr_lock.h" /* THR_LOCK, THR_LOCK_DATA */
 
-#define CRAM_CHAINS 1000000
-#define CRAM_LOCKS 1000
-#define CRAM_WORKERS 4
+#define CRAM_CHAINS 10000000
+#define CRAM_LOCKS 10000
+#define CRAM_WORKERS 8
 #define CRAM_LOADERS 4
 #define CRAM_LISTS 4
 #define CRAM_EPOCH 1000000000
 #define CRAM_PAGE 100
 #define CRAM_FILE "cram%06llx"
 #define CRAM_QUEUE 1000
-#define CRAM_WEIGHT 4
+#define CRAM_WEIGHT 16
 
 #define CRAM_LOG TRUE
 #define CRAM_NO_LOG FALSE

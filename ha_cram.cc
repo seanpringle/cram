@@ -2509,12 +2509,11 @@ ha_cram::ha_cram(handlerton *hton, TABLE_SHARE *table_arg)
 
 void ha_cram::update_state(const char *format, ...)
 {
-  char buff[1024];
   va_list args;
   va_start(args, format);
-  vsnprintf(buff, sizeof(buff), format, args);
+  vsnprintf(status_msg, sizeof(status_msg), format, args);
   va_end(args);
-  thd_proc_info(ha_thd(), buff);
+  thd_proc_info(ha_thd(), status_msg);
 }
 
 int ha_cram::record_store(uchar *buf, CramResult *result)
