@@ -118,7 +118,6 @@ typedef struct _CramTable {
   uint64 id;
   uint32 columns;
   CramList **lists;
-  CramDict **indexes;
   uint opened;
   uint index_width;
 } CramTable;

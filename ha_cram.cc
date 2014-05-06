@@ -818,30 +818,16 @@ static void cram_row_index(CramTable *table, CramPage *page, CramRow *row)
   {
     uint hashval = (row->blobs[i]) ? row->blobs[i]->hashval: 0;
     uint chain   = hashval % table->index_width;
-    if (!cram_bitmap_chk(page->bitmap, chain))
-    {
-      cram_dict_open_write(table->indexes[li], hashval);
-      cram_dict_store(table->indexes[li], hashval, page, FALSE);
-      cram_dict_close(table->indexes[li], hashval);
-      cram_bitmap_set(page->bitmap, chain);
-    }
+    cram_bitmap_set(page->bitmap, chain);
   }
 }
 
 static void cram_page_deindex(CramTable *table, CramPage *page)
 {
-  uint li = 0;
-  for (; table->lists[li] != page->list; li++);
   for (uint i = 0; i < table->index_width; i++)
   {
     uint chain = i % table->index_width;
-    if (cram_bitmap_chk(page->bitmap, chain))
-    {
-      cram_dict_open_write(table->indexes[li], i);
-      cram_dict_purge(table->indexes[li], i, page);
-      cram_dict_close(table->indexes[li], i);
-      cram_bitmap_clr(page->bitmap, chain);
-    }
+    cram_bitmap_clr(page->bitmap, chain);
   }
 }
 
@@ -1095,13 +1081,11 @@ static CramTable* cram_table_construct(const char *name, uint32 columns, uint64 
   table->opened = 0;
 
   table->lists = (CramList**) cram_alloc(sizeof(CramList*) * cram_table_lists);
-  table->indexes = (CramDict**) cram_alloc(sizeof(CramDict*) * cram_table_lists);
   table->index_width = cram_page_rows * columns * cram_index_weight;
 
   for (uint i = 0; i < cram_table_lists; i++)
   {
     table->lists[i] = cram_list_create();
-    table->indexes[i] = cram_dict_create(table->index_width, table->index_width / 10);
   }
 
   cram_stat_inc(&cram_stats_spinlock, &cram_tables_created);
@@ -1182,11 +1166,9 @@ static int cram_table_drop(const char *name)
         cram_page_free(t, p);
       }
       cram_list_free(t->lists[i]);
-      cram_dict_free(t->indexes[i]);
     }
 
     pthread_rwlock_destroy(&t->lock);
-    cram_free(t->indexes);
     cram_free(t->lists);
     cram_free(t->name);
     cram_free(t);
@@ -1905,38 +1887,16 @@ static bool cram_job_page(CramJob *job, CramPage *page)
   return TRUE;
 }
 
-static bool cram_job_index(void *item, void *context)
-{
-  CramPage *page = (CramPage*) item;
-  CramJob *job = (CramJob*) context;
-  cram_job_page(job, page);
-  return FALSE; // continue
-}
-
 static void cram_job_execute(uint id, CramJob *job)
 {
   CramTable *table = job->table;
   pthread_rwlock_rdlock(&table->lock);
 
-  if (job->condition && job->condition->type == CRAM_COND_EQ && job->condition->count == 1 && job->condition->blobs[0])
-  {
-    CramList *list = table->lists[job->list];
-    CramBlob *blob = job->condition->blobs[0];
-    CramDict *hash = table->indexes[job->list];
-    cram_list_open_read(list);
-    cram_dict_open_read(hash, blob->hashval);
-    cram_dict_get(hash, blob->hashval, cram_job_index, job);
-    cram_dict_close(hash, blob->hashval);
-    cram_list_close(list);
-  }
-  else
-  {
-    CramList *list = table->lists[job->list];
-    cram_list_open_read(list);
-    for (CramNode *node = list->first; node && !job->complete; node = node->next)
-      cram_job_page(job, (CramPage*)node->item);
-    cram_list_close(list);
-  }
+  CramList *list = table->lists[job->list];
+  cram_list_open_read(list);
+  for (CramNode *node = list->first; node && !job->complete; node = node->next)
+    cram_job_page(job, (CramPage*)node->item);
+  cram_list_close(list);
 
   job->complete = TRUE;
   pthread_rwlock_unlock(&table->lock);
@@ -2247,13 +2207,6 @@ static bool cram_show_status_cb3(void *ptr, void *context)
   return FALSE; // continue
 }
 
-static bool cram_show_status_cb4(void *ptr, void *context)
-{
-  struct cram_status_st *st = (struct cram_status_st*) context;
-  st->memory += sizeof(CramNode);
-  return FALSE; // continue
-}
-
 static bool cram_show_status_cb2(void *ptr, void *context)
 {
   CramTable *table = (CramTable*) ptr;
@@ -2266,26 +2219,6 @@ static bool cram_show_status_cb2(void *ptr, void *context)
     cram_list_open_read(table->lists[i]);
     cram_list_walk(table->lists[i], cram_show_status_cb3, st);
     cram_list_close(table->lists[i]);
-  }
-  return FALSE; // continue
-}
-
-static bool cram_show_status_cb5(void *ptr, void *context)
-{
-  CramTable *table = (CramTable*) ptr;
-  struct cram_status_st *st = (struct cram_status_st*) context;
-  st->table = table;
-
-  st->memory += (sizeof(CramDict) * cram_table_lists) + (sizeof(CramNode*) * cram_table_lists * table->index_width);
-
-  for (uint i = 0; i < cram_table_lists; i++)
-  {
-    for (uint j = 0; j < table->index_width; j++)
-    {
-      cram_dict_open_read(table->indexes[i], j);
-      cram_dict_get(table->indexes[i], j, cram_show_status_cb4, st);
-      cram_dict_close(table->indexes[i], j);
-    }
   }
   return FALSE; // continue
 }
@@ -2316,16 +2249,6 @@ static bool cram_show_status(handlerton* hton, THD* thd, stat_print_fn* stat_pri
   cram_string_printf(string, "%llu MB, shortest chain: %llu, longest: %llu",
     st->memory/1024/1024, st->dict_cmin, st->dict_cmax);
   stat_print(thd, STRING_WITH_LEN("CRAM"), STRING_WITH_LEN("dictionary"), (char*)string->buffer, string->length);
-
-  st->memory = 0;
-
-  cram_list_open_read(cram_tables);
-  cram_list_walk(cram_tables, cram_show_status_cb5, st);
-  cram_list_close(cram_tables);
-
-  cram_string_reset(string);
-  cram_string_printf(string, "%llu MB", st->memory/1024/1024);
-  stat_print(thd, STRING_WITH_LEN("CRAM"), STRING_WITH_LEN("indexes"), (char*)string->buffer, string->length);
 
   st->memory = sizeof(CramList);
 
