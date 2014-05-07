@@ -904,28 +904,29 @@ static void cram_janitor_stop()
   pthread_join(cram_janitor_thread, NULL);
 }
 
-static void cram_check_entry(CramTable *table, CramPage *page)
-{
-  CramCheckEvent *event = (CramCheckEvent*) cram_alloc(sizeof(CramCheckEvent));
-  event->table = table;
-  event->page = page;
-  bool submit = cram_queue_trysubmit(cram_check_queue, event);
-  if (!submit) cram_free(event);
-
-  pthread_spin_lock(&cram_stats_spinlock);
-  if (submit) cram_check_events_queued++; else cram_check_events_failed++;
-  cram_check_events_stalled = cram_check_queue->stalls;
-  pthread_spin_unlock(&cram_stats_spinlock);
-}
-
 static void cram_page_changed(CramTable *table, CramPage *page)
 {
   pthread_rwlock_wrlock(&page->lock);
   bool dirty = ++page->changes > cram_page_rows/4 || page->count == 0;
   bool rebuild = dirty && !page->queued;
   if (rebuild) page->queued = TRUE;
-  if (rebuild) cram_check_entry(table, page);
+
+  CramCheckEvent *event = (CramCheckEvent*) cram_alloc(sizeof(CramCheckEvent));
+  event->table = table;
+  event->page = page;
+
+  bool submit = cram_queue_trysubmit(cram_check_queue, event);
+  if (!submit)
+  {
+    cram_free(event);
+    page->queued = FALSE;
+  }
   pthread_rwlock_unlock(&page->lock);
+
+  pthread_spin_lock(&cram_stats_spinlock);
+  if (submit) cram_check_events_queued++; else cram_check_events_failed++;
+  cram_check_events_stalled = cram_check_queue->stalls;
+  pthread_spin_unlock(&cram_stats_spinlock);
 }
 
 static CramRow* cram_row_create(CramTable *table, uint64 id, CramBlob **blobs, bool log_entry, uint insert_mode)
