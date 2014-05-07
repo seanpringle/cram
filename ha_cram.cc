@@ -924,8 +924,8 @@ static void cram_page_changed(CramTable *table, CramPage *page)
   bool dirty = ++page->changes > cram_page_rows/4 || page->count == 0;
   bool rebuild = dirty && !page->queued;
   if (rebuild) page->queued = TRUE;
-  pthread_rwlock_unlock(&page->lock);
   if (rebuild) cram_check_entry(table, page);
+  pthread_rwlock_unlock(&page->lock);
 }
 
 static CramRow* cram_row_create(CramTable *table, uint64 id, CramBlob **blobs, bool log_entry, uint insert_mode)
@@ -2229,13 +2229,13 @@ static bool cram_show_status(handlerton* hton, THD* thd, stat_print_fn* stat_pri
 
   struct cram_status_st _st, *st = &_st;
 
-  st->dict_clen = 0;
   st->dict_cmin = 0;
   st->dict_cmax = 0;
   st->memory = sizeof(CramDict) + (sizeof(CramNode*) * cram_dict_chains) + (sizeof(pthread_rwlock_t) * cram_dict_locks);
 
   for (uint i = 0; i < cram_dict_chains; i++)
   {
+    st->dict_clen = 0;
     cram_dict_open_read(cram_dict, i);
     cram_dict_get(cram_dict, i, cram_show_status_cb1, st);
     cram_dict_close(cram_dict, i);
