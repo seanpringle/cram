@@ -17,14 +17,6 @@
   @file ha_cram.cc
 */
 
-/*
-TODO
-cram_page_free check janitor queue for pages
-find a way to defrag/purge empty pages without ALTER/OPTIMIZE
-cram_row_create speed up empty row scan (or always append and do defrag/purge)
-table/page ref counts?
-*/
-
 #ifdef USE_PRAGMA_IMPLEMENTATION
 #pragma implementation        // gcc: Class implementation
 #endif
@@ -514,6 +506,19 @@ static CramTable* cram_table_open(const char *name, uint width)
     table->lists_count = cram_table_lists;
     table->hints_width = cram_table_list_hints;
     table->compress_boundary = cram_compress_boundary;
+
+    char fname[1024];
+    snprintf(fname, sizeof(fname), "%s.cram", table->name);
+    FILE *data = fopen(fname, "rb");
+
+    if (data)
+    {
+      fread(&table->width, 1, sizeof(size_t), data);
+      fread(&table->lists_count, 1, sizeof(size_t), data);
+      fread(&table->hints_width, 1, sizeof(size_t), data);
+      fread(&table->compress_boundary, 1, sizeof(size_t), data);
+    }
+
     table->lists   = (list_t**) cram_alloc(sizeof(list_t*) * table->lists_count);
     table->hints   = (bmp_t**)  cram_alloc(sizeof(bmp_t*)  * table->lists_count);
     table->changes = (uint*)    cram_alloc(sizeof(uint)    * table->lists_count);
@@ -528,17 +533,8 @@ static CramTable* cram_table_open(const char *name, uint width)
 
     list_insert_head(cram_tables, table);
 
-    char fname[1024];
-    snprintf(fname, sizeof(fname), "%s.cram", table->name);
-    FILE *data = fopen(fname, "rb");
-
     if (data)
     {
-      fread(&table->width, 1, sizeof(size_t), data);
-      fread(&table->lists_count, 1, sizeof(size_t), data);
-      fread(&table->hints_width, 1, sizeof(size_t), data);
-      fread(&table->compress_boundary, 1, sizeof(size_t), data);
-
       uint list = 0; uint64 width = 0;
       while (fread(&width, 1, sizeof(uint64), data) == sizeof(uint64))
       {
@@ -1591,12 +1587,31 @@ int ha_cram::rename_table(const char *from, const char *to)
 
   if (table)
   {
+    if (cram_table != table)
+      table->users++;
+
+    while (table->users > 1)
+    {
+      pthread_rwlock_unlock(&cram_tables_lock);
+      usleep(1000);
+      pthread_rwlock_wrlock(&cram_tables_lock);
+    }
+
     cram_free(table->name);
     table->name = (char*) cram_alloc(strlen(to)+1);
     strcpy(table->name, to);
+
+    char oname[1024], nname[1024];
+    snprintf(oname, sizeof(oname), "%s.cram", from);
+    snprintf(nname, sizeof(nname), "%s.cram", to);
+    rename(oname, nname);
+
+    if (cram_table != table)
+      table->users--;
   }
 
   pthread_rwlock_unlock(&cram_tables_lock);
+  checkpoint_asap = TRUE;
   return 0;
 }
 
