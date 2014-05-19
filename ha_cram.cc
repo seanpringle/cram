@@ -37,7 +37,7 @@ uint cram_checkpoint_seconds;
 uint cram_checkpoint_threads;
 
 list_t *cram_tables;
-pthread_rwlock_t cram_tables_lock;
+pthread_mutex_t cram_tables_lock;
 
 bool checkpoint_done;
 bool checkpoint_asap;
@@ -528,11 +528,11 @@ static CramTable* cram_table_open(const char *name, uint width)
     table->lists   = (list_t**) cram_alloc(sizeof(list_t*) * table->lists_count);
     table->hints   = (bmp_t***) cram_alloc(sizeof(bmp_t**) * table->lists_count);
     table->changes = (uint*)    cram_alloc(sizeof(uint)    * table->lists_count);
-    table->locks   = (pthread_rwlock_t*) cram_alloc(sizeof(pthread_rwlock_t) * table->lists_count);
+    table->locks   = (pthread_mutex_t*) cram_alloc(sizeof(pthread_mutex_t) * table->lists_count);
 
     for (uint i = 0; i < table->lists_count; i++)
     {
-      pthread_rwlock_init(&table->locks[i], NULL);
+      pthread_mutex_init(&table->locks[i], NULL);
       table->lists[i] = list_alloc();
       table->hints[i] = (bmp_t**) cram_alloc(sizeof(bmp_t*) * width);
 
@@ -580,6 +580,7 @@ static void cram_table_drop(CramTable *table, bool hard)
 
   for (uint i = 0; i < table->lists_count; i++)
   {
+    pthread_mutex_destroy(&table->locks[i]);
     while (!list_is_empty(table->lists[i]))
       cram_free(list_remove_head(table->lists[i]));
     list_free(table->lists[i]);
@@ -612,7 +613,7 @@ static void* cram_checkpointer(void *p)
   for (uint li = 0; li < table->lists_count; li++)
   {
     list_t *list = table->lists[li];
-    pthread_rwlock_rdlock(&table->locks[li]);
+    pthread_mutex_lock(&table->locks[li]);
 
     for (node_t *node = list->head; node; node = node->next)
     {
@@ -626,7 +627,7 @@ static void* cram_checkpointer(void *p)
       fwrite(row, 1, width, data);
     }
 
-    pthread_rwlock_unlock(&table->locks[li]);
+    pthread_mutex_unlock(&table->locks[li]);
   }
   fclose(data);
   rename(nname, fname);
@@ -652,7 +653,7 @@ static void* cram_checkpoint(void *p)
     struct timeval time_start, time_stop;
     gettimeofday(&time_start, NULL);
 
-    pthread_rwlock_wrlock(&cram_tables_lock);
+    pthread_mutex_lock(&cram_tables_lock);
 
     for (node_t *tnode = cram_tables->head; tnode; tnode = tnode->next)
     {
@@ -664,7 +665,7 @@ static void* cram_checkpoint(void *p)
       }
     }
 
-    pthread_rwlock_unlock(&cram_tables_lock);
+    pthread_mutex_unlock(&cram_tables_lock);
 
     uint spawned = 0;
     pthread_t writers[cram_checkpoint_threads];
@@ -686,7 +687,7 @@ static void* cram_checkpoint(void *p)
     for (uint i = 0; i < spawned; i++)
       pthread_join(writers[i], NULL);
 
-    pthread_rwlock_wrlock(&cram_tables_lock);
+    pthread_mutex_lock(&cram_tables_lock);
 
     while (tables->length)
     {
@@ -694,7 +695,7 @@ static void* cram_checkpoint(void *p)
       table->users--;
     }
 
-    pthread_rwlock_unlock(&cram_tables_lock);
+    pthread_mutex_unlock(&cram_tables_lock);
 
     gettimeofday(&time_stop, NULL);
     cram_checkpoint_duration_usec = (time_stop.tv_sec * 1000000 + time_stop.tv_usec)
@@ -720,7 +721,7 @@ static bool cram_show_status(handlerton* hton, THD* thd, stat_print_fn* stat_pri
       meta += sizeof(list_t*) + sizeof(list_t);
       meta += sizeof(bmp_t*) * table->width;
       meta += (table->hints_width/8+1) * table->width;
-      meta += sizeof(pthread_rwlock_t);
+      meta += sizeof(pthread_mutex_t);
 
       node_t *rnode = table->lists[i]->head;
 
@@ -796,7 +797,7 @@ static int cram_init_func(void *p)
 
   thr_lock_init(&mysql_lock);
 
-  pthread_rwlock_init(&cram_tables_lock, NULL);
+  pthread_mutex_init(&cram_tables_lock, NULL);
   pthread_create(&checkpoint_thread, NULL, cram_checkpoint, NULL);
 
   cram_tables = list_alloc();
@@ -809,7 +810,7 @@ static int cram_done_func(void *p)
   checkpoint_done = TRUE;
   pthread_join(checkpoint_thread, NULL);
 
-  pthread_rwlock_destroy(&cram_tables_lock);
+  pthread_mutex_destroy(&cram_tables_lock);
 
   while (!list_is_empty(cram_tables))
     cram_table_drop((CramTable*)list_remove_head(cram_tables), FALSE);
@@ -887,12 +888,12 @@ int ha_cram::open(const char *name, int mode, uint test_if_locked)
 
   thr_lock_data_init(&mysql_lock, &lock, NULL);
 
-  pthread_rwlock_wrlock(&cram_tables_lock);
+  pthread_mutex_lock(&cram_tables_lock);
 
   cram_table = cram_table_open(name, table->s->fields);
   cram_table->users++;
 
-  pthread_rwlock_unlock(&cram_tables_lock);
+  pthread_mutex_unlock(&cram_tables_lock);
 
   return cram_table ? 0: -1;
 }
@@ -901,12 +902,12 @@ int ha_cram::close(void)
 {
   cram_debug("%s", __func__);
 
-  pthread_rwlock_wrlock(&cram_tables_lock);
+  pthread_mutex_lock(&cram_tables_lock);
 
   cram_table->users--;
   cram_table = NULL;
 
-  pthread_rwlock_unlock(&cram_tables_lock);
+  pthread_mutex_unlock(&cram_tables_lock);
 
   empty_trash();
   empty_conds();
@@ -1145,11 +1146,11 @@ uint ha_cram::shortest_list()
   uint64 length = (~0ULL);
   for (uint i = 0; i < cram_table->lists_count; i++)
   {
-    if (pthread_rwlock_tryrdlock(&cram_table->locks[i]) == 0)
+    if (pthread_mutex_trylock(&cram_table->locks[i]) == 0)
     {
       if (cram_table->lists[i]->length < length)
         list = i;
-      pthread_rwlock_unlock(&cram_table->locks[i]);
+      pthread_mutex_unlock(&cram_table->locks[i]);
     }
   }
   return list;
@@ -1170,10 +1171,10 @@ int ha_cram::write_row(uchar *buf)
   uchar *row = record_place(buf);
   uint list = shortest_list();
 
-  pthread_rwlock_wrlock(&cram_table->locks[list]);
+  pthread_mutex_lock(&cram_table->locks[list]);
   list_insert_head(cram_table->lists[list], row);
   update_list_hints(list, row);
-  pthread_rwlock_unlock(&cram_table->locks[list]);
+  pthread_mutex_unlock(&cram_table->locks[list]);
 
   dbug_tmp_restore_column_map(table->read_set, org_bitmap);
   counter_rows_written++;
@@ -1191,13 +1192,13 @@ int ha_cram::update_row(const uchar *old_data, uchar *new_data)
   uint list = shortest_list();
 
   if (cram_list != list)
-    pthread_rwlock_wrlock(&cram_table->locks[list]);
+    pthread_mutex_lock(&cram_table->locks[list]);
 
   list_insert_head(cram_table->lists[list], new_row);
   update_list_hints(list, new_row);
 
   if (cram_list != list)
-    pthread_rwlock_unlock(&cram_table->locks[list]);
+    pthread_mutex_unlock(&cram_table->locks[list]);
 
   dbug_tmp_restore_column_map(table->read_set, org_bitmap);
   counter_rows_updated++;
@@ -1219,10 +1220,10 @@ int ha_cram::delete_row(const uchar *buf)
   {
     for (uint list = 0; list < cram_table->lists_count; list++)
     {
-      pthread_rwlock_wrlock(&cram_table->locks[list]);
+      pthread_mutex_lock(&cram_table->locks[list]);
       list_delete(cram_table->lists[list], row);
       cram_table->changes[cram_list]++;
-      pthread_rwlock_unlock(&cram_table->locks[list]);
+      pthread_mutex_unlock(&cram_table->locks[list]);
     }
   }
   cram_free(row);
@@ -1233,11 +1234,11 @@ int ha_cram::delete_row(const uchar *buf)
 bool ha_cram::next_list()
 {
   if (cram_list < UINT_MAX)
-    pthread_rwlock_unlock(&cram_table->locks[cram_list]);
+    pthread_mutex_unlock(&cram_table->locks[cram_list]);
 
   for (uint i = 0; i < cram_table->lists_count; i++)
   {
-    if (!bmp_chk(cram_lists, i) && pthread_rwlock_trywrlock(&cram_table->locks[i]) == 0)
+    if (!bmp_chk(cram_lists, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
     {
       cram_list = i;
       cram_results = cram_table->lists[i];
@@ -1250,7 +1251,7 @@ bool ha_cram::next_list()
   {
     if (!bmp_chk(cram_lists, i))
     {
-      pthread_rwlock_wrlock(&cram_table->locks[i]);
+      pthread_mutex_lock(&cram_table->locks[i]);
       cram_list = i;
       cram_results = cram_table->lists[i];
       cram_result = cram_results->head;
@@ -1279,7 +1280,7 @@ int ha_cram::rnd_end()
   cram_debug("%s", __func__);
 
   if (cram_list < UINT_MAX)
-    pthread_rwlock_unlock(&cram_table->locks[cram_list]);
+    pthread_mutex_unlock(&cram_table->locks[cram_list]);
 
   cram_list    = UINT_MAX;
   cram_result  = NULL;
@@ -1515,18 +1516,18 @@ int ha_cram::rnd_pos(uchar *buf, uchar *pos)
   //cram_debug("%s", __func__);
 
   if (cram_list < UINT_MAX)
-    pthread_rwlock_unlock(&cram_table->locks[cram_list]);
+    pthread_mutex_unlock(&cram_table->locks[cram_list]);
 
   CramPosition *cp = (CramPosition*)pos;
 
   cram_list = cp->list;
-  pthread_rwlock_wrlock(&cram_table->locks[cram_list]);
+  pthread_mutex_lock(&cram_table->locks[cram_list]);
   cram_results = cram_table->lists[cram_list];
   cram_result = list_locate(cram_results, cp->row);
 
   if (!cram_result)
   {
-    pthread_rwlock_unlock(&cram_table->locks[cram_list]);
+    pthread_mutex_unlock(&cram_table->locks[cram_list]);
     cram_list    = UINT_MAX;
     cram_results = NULL;
     cram_result  = NULL;
@@ -1545,9 +1546,9 @@ int ha_cram::info(uint flag)
     uint64 rows = 0;
     for (uint i = 0; i < cram_table->lists_count; i++)
     {
-      pthread_rwlock_rdlock(&cram_table->locks[i]);
+      pthread_mutex_lock(&cram_table->locks[i]);
       rows += list_length(cram_table->lists[i]),
-      pthread_rwlock_unlock(&cram_table->locks[i]);
+      pthread_mutex_unlock(&cram_table->locks[i]);
     }
 
     stats.records = rows;
@@ -1592,7 +1593,7 @@ int ha_cram::delete_table(const char *name)
 {
   cram_debug("%s %s", __func__, name);
 
-  pthread_rwlock_wrlock(&cram_tables_lock);
+  pthread_mutex_lock(&cram_tables_lock);
 
   CramTable *table = cram_table_open(name, 0);
 
@@ -1602,14 +1603,14 @@ int ha_cram::delete_table(const char *name)
     table->dropping = TRUE;
     while (table->users > 1)
     {
-      pthread_rwlock_unlock(&cram_tables_lock);
+      pthread_mutex_unlock(&cram_tables_lock);
       usleep(1000);
-      pthread_rwlock_wrlock(&cram_tables_lock);
+      pthread_mutex_lock(&cram_tables_lock);
     }
     cram_table_drop(table, TRUE);
   }
 
-  pthread_rwlock_unlock(&cram_tables_lock);
+  pthread_mutex_unlock(&cram_tables_lock);
 
   return 0;
 }
@@ -1618,7 +1619,7 @@ int ha_cram::rename_table(const char *from, const char *to)
 {
   cram_debug("%s %s %s", __func__, from, to);
 
-  pthread_rwlock_wrlock(&cram_tables_lock);
+  pthread_mutex_lock(&cram_tables_lock);
 
   CramTable *table = cram_table_open(from, 0);
 
@@ -1629,9 +1630,9 @@ int ha_cram::rename_table(const char *from, const char *to)
 
     while (table->users > 1)
     {
-      pthread_rwlock_unlock(&cram_tables_lock);
+      pthread_mutex_unlock(&cram_tables_lock);
       usleep(1000);
-      pthread_rwlock_wrlock(&cram_tables_lock);
+      pthread_mutex_lock(&cram_tables_lock);
     }
 
     cram_free(table->name);
@@ -1647,7 +1648,7 @@ int ha_cram::rename_table(const char *from, const char *to)
       table->users--;
   }
 
-  pthread_rwlock_unlock(&cram_tables_lock);
+  pthread_mutex_unlock(&cram_tables_lock);
   checkpoint_asap = TRUE;
   return 0;
 }
