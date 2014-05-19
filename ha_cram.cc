@@ -99,7 +99,7 @@ static void cram_free(void *ptr)
 }
 
 /* DJBX33A */
-static uint32 cram_hash33(const uchar *buffer, size_t length)
+static uint32 cram_hash(const uchar *buffer, size_t length)
 {
   uint32 hash = 5381; size_t i = 0;
   for (
@@ -108,6 +108,11 @@ static uint32 cram_hash33(const uchar *buffer, size_t length)
     hash = hash * 33 + buffer[i++]
   );
   return hash;
+}
+
+static uint32 cram_hash_int64(int64 n)
+{
+  return n < 0 ? n*-1: n;
 }
 
 static size_t cram_deflate(uchar *data, size_t width)
@@ -475,11 +480,11 @@ static void cram_row_index(CramTable *table, uint list, CramRow *row)
         case CRAM_INT32:
         case CRAM_INT64:
           int64 ni64; cram_field_int64(field, &ni64);
-          hashval = cram_hash33((uchar*)&ni64, sizeof(int64));
+          hashval = cram_hash_int64(ni64);
           bmp_set(table->hints[list][col], hashval % table->hints_width);
           break;
         case CRAM_TINYSTRING:
-          hashval = cram_hash33(buffer, length);
+          hashval = cram_hash(buffer, length);
           bmp_set(table->hints[list][col], hashval % table->hints_width);
           break;
         default: break;
@@ -744,12 +749,32 @@ static bool cram_show_status(handlerton* hton, THD* thd, stat_print_fn* stat_pri
 
     CramTable *table = (CramTable*) node->payload;
 
-    str_print(str, "%s w %u l %u h %u c %u", table->name, table->width, table->lists_count, table->hints_width, table->compress_boundary);
+    str_print(str, "%s width %u lists %u hints %u compress %u", table->name, table->width, table->lists_count, table->hints_width, table->compress_boundary);
 
+    uint min = UINT_MAX, max = 0, avg, tot = 0;
     for (uint i = 0; i < table->lists_count; i++)
-      str_print(str, " %llu", table->lists[i]->length);
+    {
+      uint len = table->lists[i]->length;
+      if (len < min) min = len;
+      if (len > max) max = len;
+      tot += len;
+    }
+    avg = tot / table->lists_count;
+    str_print(str, " min %llu max %llu mean %llu total %llu", min, max, avg, tot);
 
     stat_print(thd, STRING_WITH_LEN("CRAM"), STRING_WITH_LEN("table"), str->buffer, str->length);
+
+    for (uint col = 0; col < table->width; col++)
+    {
+      str_reset(str);
+      str_print(str, "%s [%3u] ", table->name, col);
+
+      for (uint i = 0; i < table->hints_width; i++)
+        str_print(str, "%u", bmp_chk(table->hints[0][col], i));
+
+      stat_print(thd, STRING_WITH_LEN("CRAM"), STRING_WITH_LEN("table"), str->buffer, str->length);
+    }
+
     node = node->next;
   }
 
@@ -1697,7 +1722,7 @@ void ha_cram::check_condition ( const COND * cond )
         {
           cc->type    = CRAM_INT64;
           cc->bigint  = arg->val_int();
-          cc->hashval = cram_hash33((uchar*)&cc->bigint, sizeof(int64));
+          cc->hashval = cram_hash_int64(cc->bigint);
           cram_debug("%s ECP EQ/NE/LT/GT/LE/GE INT %lld", __func__, cc->bigint);
         }
         else
@@ -1706,7 +1731,7 @@ void ha_cram::check_condition ( const COND * cond )
           cc->type = CRAM_TINYSTRING;
           cc->length = str->length();
           memmove(cc->buffer, str->ptr(), str->length());
-          cc->hashval = cram_hash33(cc->buffer, cc->length);
+          cc->hashval = cram_hash(cc->buffer, cc->length);
           cram_debug("%s ECP EQ/NE/LT/GT/LE/GE STR %lld", __func__, cc->length);
         }
       }
