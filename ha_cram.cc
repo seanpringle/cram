@@ -1108,7 +1108,7 @@ uint ha_cram::shortest_list()
   }
 
   uint list = 0;
-  uint64 length = UINT64_MAX;
+  uint64 length = (~0ULL);
   for (uint i = 0; i < cram_table->lists_count; i++)
   {
     if (pthread_rwlock_tryrdlock(&cram_table->locks[i]) == 0)

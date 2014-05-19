@@ -19,11 +19,11 @@
 #endif
 
 #define MYSQL_SERVER 1 // required for THD class
+#include "my_global.h"
 #include <sql_table.h>
 #include <sql_class.h>
 #include <probes_mysql.h>
 #include "thr_lock.h" /* THR_LOCK, THR_LOCK_DATA */
-#include <search.h>
 
 typedef bool (*map_fn)(void*, void*);
 typedef int (*cmp_fn)(void*, void*);
