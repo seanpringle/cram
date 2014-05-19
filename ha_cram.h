@@ -55,7 +55,7 @@ typedef struct _CramTable {
   size_t compress_boundary;
   pthread_rwlock_t *locks;
   list_t **lists;
-  bmp_t **hints;
+  bmp_t ***hints;
   uint *changes;
   bool dropping;
 } CramTable;

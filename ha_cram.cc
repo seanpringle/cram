@@ -458,9 +458,10 @@ static bool cram_field_int64(uchar *row, int64 *res)
 
 static void cram_row_index(CramTable *table, uint list, CramRow *row)
 {
-  for (uint col = 0; col < table->width; col++)
+  uchar *field = cram_field(table, row, 0);
+
+  for (uint col = 0; col < table->width; field += cram_field_width(field), col++)
   {
-    uchar  *field = cram_field(table, row, col);
     uint     type = cram_field_type(field);
     uchar *buffer = cram_field_buffer(field);
     uint   length = cram_field_length(field);
@@ -475,11 +476,11 @@ static void cram_row_index(CramTable *table, uint list, CramRow *row)
         case CRAM_INT64:
           int64 ni64; cram_field_int64(field, &ni64);
           hashval = cram_hash33((uchar*)&ni64, sizeof(int64));
-          bmp_set(table->hints[list], hashval % table->hints_width);
+          bmp_set(table->hints[list][col], hashval % table->hints_width);
           break;
         case CRAM_TINYSTRING:
           hashval = cram_hash33(buffer, length);
-          bmp_set(table->hints[list], hashval % table->hints_width);
+          bmp_set(table->hints[list][col], hashval % table->hints_width);
           break;
         default: break;
       }
@@ -520,15 +521,18 @@ static CramTable* cram_table_open(const char *name, uint width)
     }
 
     table->lists   = (list_t**) cram_alloc(sizeof(list_t*) * table->lists_count);
-    table->hints   = (bmp_t**)  cram_alloc(sizeof(bmp_t*)  * table->lists_count);
+    table->hints   = (bmp_t***) cram_alloc(sizeof(bmp_t**) * table->lists_count);
     table->changes = (uint*)    cram_alloc(sizeof(uint)    * table->lists_count);
     table->locks   = (pthread_rwlock_t*) cram_alloc(sizeof(pthread_rwlock_t) * table->lists_count);
 
     for (uint i = 0; i < table->lists_count; i++)
     {
-      table->lists[i] = list_alloc();
-      table->hints[i]  = bmp_alloc(table->hints_width);
       pthread_rwlock_init(&table->locks[i], NULL);
+      table->lists[i] = list_alloc();
+      table->hints[i] = (bmp_t**) cram_alloc(sizeof(bmp_t*) * width);
+
+      for (uint j = 0; j < width; j++)
+        table->hints[i][j] = bmp_alloc(table->hints_width);
     }
 
     list_insert_head(cram_tables, table);
@@ -574,7 +578,11 @@ static void cram_table_drop(CramTable *table, bool hard)
     while (!list_is_empty(table->lists[i]))
       cram_free(list_remove_head(table->lists[i]));
     list_free(table->lists[i]);
-    bmp_free(table->hints[i]);
+
+    for (uint j = 0; j < table->width; j++)
+      bmp_free(table->hints[i][j]);
+
+    cram_free(table->hints[i]);
   }
 
   cram_free(table->name);
@@ -700,15 +708,16 @@ static bool cram_show_status(handlerton* hton, THD* thd, stat_print_fn* stat_pri
   while (node)
   {
     CramTable *table = (CramTable*) node->payload;
-    meta += sizeof(CramTable) + strlen(table->name)
-      + (sizeof(list_t*) * table->lists_count)
-      + (table->hints_width/8+1)
-      + (sizeof(pthread_rwlock_t) * table->lists_count);
+    meta += sizeof(CramTable) + strlen(table->name);
 
     for (uint i = 0; i < table->lists_count; i++)
     {
+      meta += sizeof(list_t*) + sizeof(list_t);
+      meta += sizeof(bmp_t*) * table->width;
+      meta += (table->hints_width/8+1) * table->width;
+      meta += sizeof(pthread_rwlock_t);
+
       node_t *rnode = table->lists[i]->head;
-      meta += sizeof(list_t);
 
       while (rnode)
       {
@@ -1271,8 +1280,11 @@ int ha_cram::rnd_next(uchar *buf)
 
       if (cram_results && cram_table->changes[cram_list] > cram_results->length/4)
       {
-        bmp_t *bmp = cram_table->hints[cram_list];
-        bmp_all_clr(bmp, cram_table->lists_count);
+        for (uint i = 0; i < cram_table->width; i++)
+        {
+          bmp_t *bmp = cram_table->hints[cram_list][i];
+          bmp_all_clr(bmp, cram_table->hints_width);
+        }
         for (node_t *node = cram_results->head; node; node = node->next)
         {
           CramRow *row = (CramRow*) node->payload;
@@ -1293,7 +1305,7 @@ int ha_cram::rnd_next(uchar *buf)
             {
               case CRAM_INT64:
               case CRAM_TINYSTRING:
-                skip = !bmp_chk(cram_table->hints[cram_list], cc->hashval % cram_table->hints_width);
+                skip = !bmp_chk(cram_table->hints[cram_list][cc->column], cc->hashval % cram_table->hints_width);
                 break;
             }
           }
@@ -1812,10 +1824,10 @@ static MYSQL_SYSVAR_UINT(table_lists, cram_table_lists, 0,
   "Partitions per table.", 0, cram_table_lists_update, 1000, 8, UINT_MAX, 1);
 
 static MYSQL_SYSVAR_UINT(table_list_hints, cram_table_list_hints, 0,
-  "Width of table list hints bitmap.", 0, cram_table_list_hints_update, 100000, 1000, UINT_MAX, 1);
+  "Width of table list hints bitmap.", 0, cram_table_list_hints_update, 1000, 1000, UINT_MAX, 1);
 
 static MYSQL_SYSVAR_UINT(compress_boundary, cram_compress_boundary, 0,
-  "Compress strings longer than N bytes.", 0, cram_compress_boundary_update, 256, 32, 256, 1);
+  "Compress strings longer than N bytes.", 0, cram_compress_boundary_update, 128, 32, 256, 1);
 
 static MYSQL_SYSVAR_UINT(checkpoint_interval, cram_checkpoint_seconds, 0,
   "Checkpoint interval.", 0, cram_checkpoint_seconds_update, 60, 10, 300, 1);
