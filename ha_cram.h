@@ -65,18 +65,22 @@ typedef struct _CramPosition {
   CramRow *row;
 } CramPosition;
 
-typedef struct _CramCondition {
-  uint cond;
+typedef struct _CramItem {
   uint type;
-  uint column;
   int64 bigint;
   uchar buffer[256];
   uint length;
   uint hashval;
+} CramItem;
+
+typedef struct _CramCondition {
+  uint cond;
+  uint column;
+  list_t *items;
 } CramCondition;
 
 enum {
-  CRAM_NULL,
+  CRAM_NULL=0,
   CRAM_INT08,
   CRAM_INT32,
   CRAM_INT64,
@@ -85,7 +89,7 @@ enum {
 };
 
 enum {
-  CRAM_EQ,
+  CRAM_EQ=1,
   CRAM_NE,
   CRAM_LT,
   CRAM_GT,
@@ -93,10 +97,11 @@ enum {
   CRAM_GE,
   CRAM_ISNULL,
   CRAM_ISNOTNULL,
+  CRAM_IN,
 };
 
 enum {
-  CRAM_INSERT,
+  CRAM_INSERT=1,
   CRAM_DELETE,
 };
 
