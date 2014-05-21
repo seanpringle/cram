@@ -1011,7 +1011,6 @@ uchar* ha_cram::record_place(uchar *buf)
 {
 //  cram_debug("%s", __func__);
   size_t length = 0;
-  uchar *oldrow = cram_result ? (uchar*) cram_result->payload: NULL;
 
   uint real_lengths[table->s->fields];
   memset(real_lengths, 0, sizeof(real_lengths));
@@ -1028,50 +1027,42 @@ uchar* ha_cram::record_place(uchar *buf)
 
     length += 1;
 
-    if (bitmap_is_set(table->write_set, col))
+    if (field->is_null())
     {
-      if (field->is_null())
-      {
-        // nop
-      }
+      // nop
+    }
+    else
+    if (field->result_type() == INT_RESULT)
+    {
+      if (field->val_int() < 128 && field->val_int() > -128)
+        length += sizeof(int8_t);
       else
-      if (field->result_type() == INT_RESULT)
-      {
-        if (field->val_int() < 128 && field->val_int() > -128)
-          length += sizeof(int8_t);
-        else
-          length += sizeof(int64);
-      }
-      else
-      {
-        char pad[1024];
-        String tmp(pad, sizeof(pad), &my_charset_bin);
-        field->val_str(&tmp, &tmp);
-
-        if (tmp.length() < cram_table->compress_boundary)
-        {
-          real_lengths[col] = tmp.length();
-          length += tmp.length() + sizeof(uint8_t);
-        }
-        else
-        {
-          real_lengths[col] = tmp.length();
-          compressed[col] = (uchar*) cram_alloc(real_lengths[col]);
-          memmove(compressed[col], tmp.ptr(), real_lengths[col]);
-          comp_lengths[col] = cram_deflate(compressed[col], real_lengths[col]);
-          if (comp_lengths[col] == UINT_MAX)
-          {
-            comp_lengths[col] = real_lengths[col];
-            memmove(compressed[col], tmp.ptr(), real_lengths[col]);
-          }
-          length += comp_lengths[col] + sizeof(uint) + sizeof(uint);
-        }
-      }
+        length += sizeof(int64);
     }
     else
     {
-      uchar *buff = cram_field(cram_table, oldrow, col);
-      length += cram_field_width(buff);
+      char pad[1024];
+      String tmp(pad, sizeof(pad), &my_charset_bin);
+      field->val_str(&tmp, &tmp);
+
+      if (tmp.length() < cram_table->compress_boundary)
+      {
+        real_lengths[col] = tmp.length();
+        length += tmp.length() + sizeof(uint8_t);
+      }
+      else
+      {
+        real_lengths[col] = tmp.length();
+        compressed[col] = (uchar*) cram_alloc(real_lengths[col]);
+        memmove(compressed[col], tmp.ptr(), real_lengths[col]);
+        comp_lengths[col] = cram_deflate(compressed[col], real_lengths[col]);
+        if (comp_lengths[col] == UINT_MAX)
+        {
+          comp_lengths[col] = real_lengths[col];
+          memmove(compressed[col], tmp.ptr(), real_lengths[col]);
+        }
+        length += comp_lengths[col] + sizeof(uint) + sizeof(uint);
+      }
     }
   }
 
@@ -1082,62 +1073,52 @@ uchar* ha_cram::record_place(uchar *buf)
     Field *field = table->field[col];
     uchar *buff = cram_field(cram_table, row, col);
 
-    if (bitmap_is_set(table->write_set, col))
+    if (field->is_null())
     {
-      if (field->is_null())
+      *buff = CRAM_NULL;
+    }
+    else
+    if (field->result_type() == INT_RESULT)
+    {
+      if (field->val_int() < 128 && field->val_int() > -128)
       {
-        *buff = CRAM_NULL;
+        *buff++ = CRAM_INT08;
+        *((int8_t*)buff) = field->val_int();
       }
       else
-      if (field->result_type() == INT_RESULT)
+      if (field->val_int() < INT_MAX && field->val_int() > INT_MIN)
       {
-        if (field->val_int() < 128 && field->val_int() > -128)
-        {
-          *buff++ = CRAM_INT08;
-          *((int8_t*)buff) = field->val_int();
-        }
-        else
-        if (field->val_int() < INT_MAX && field->val_int() > INT_MIN)
-        {
-          *buff++ = CRAM_INT32;
-          *((int32_t*)buff) = field->val_int();
-        }
-        else
-        {
-          *buff++ = CRAM_INT64;
-          *((int64_t*)buff) = field->val_int();
-        }
+        *buff++ = CRAM_INT32;
+        *((int32_t*)buff) = field->val_int();
       }
       else
       {
-        if (!compressed[col])
-        {
-          char pad[1024];
-          String tmp(pad, sizeof(pad), &my_charset_bin);
-          field->val_str(&tmp, &tmp);
-
-          *buff++ = CRAM_TINYSTRING;
-          *((uint8_t*)buff) = tmp.length();
-          buff += sizeof(uint8_t);
-          memmove(buff, tmp.ptr(), tmp.length());
-        }
-        else
-        {
-          *buff++ = CRAM_STRING;
-          *((uint*)buff) = comp_lengths[col];
-          buff += sizeof(uint);
-          *((uint*)buff) = real_lengths[col];
-          buff += sizeof(uint);
-          memmove(buff, compressed[col], comp_lengths[col]);
-        }
+        *buff++ = CRAM_INT64;
+        *((int64_t*)buff) = field->val_int();
       }
     }
     else
     {
-      uchar *obuff = cram_field(cram_table, oldrow, col);
-      uint  owidth = cram_field_width(buff);
-      memmove(buff, obuff, owidth);
-      buff += owidth;
+      if (!compressed[col])
+      {
+        char pad[1024];
+        String tmp(pad, sizeof(pad), &my_charset_bin);
+        field->val_str(&tmp, &tmp);
+
+        *buff++ = CRAM_TINYSTRING;
+        *((uint8_t*)buff) = tmp.length();
+        buff += sizeof(uint8_t);
+        memmove(buff, tmp.ptr(), tmp.length());
+      }
+      else
+      {
+        *buff++ = CRAM_STRING;
+        *((uint*)buff) = comp_lengths[col];
+        buff += sizeof(uint);
+        *((uint*)buff) = real_lengths[col];
+        buff += sizeof(uint);
+        memmove(buff, compressed[col], comp_lengths[col]);
+      }
     }
 
     if (compressed[col])
