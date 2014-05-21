@@ -35,6 +35,7 @@ uint cram_table_list_hints;
 uint cram_compress_boundary;
 uint cram_checkpoint_seconds;
 uint cram_checkpoint_threads;
+uint cram_worker_threads;
 
 list_t *cram_tables;
 pthread_mutex_t cram_tables_lock;
@@ -837,7 +838,9 @@ ha_cram::ha_cram(handlerton *hton, TABLE_SHARE *table_arg)
   cram_table = NULL;
   cram_conds = NULL;
   cram_trash = NULL;
-  cram_lists = NULL;
+  cram_lists_done = NULL;
+  bulk_insert = FALSE;
+  bulk_insert_list = 0;
   clear_state();
 }
 
@@ -1250,35 +1253,35 @@ bool ha_cram::next_list()
 
   for (uint i = cram_list+1; i < cram_table->lists_count; i++)
   {
-    if (!bmp_chk(cram_lists, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
+    if (!bmp_chk(cram_lists_done, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
     {
       cram_list = i;
       cram_results = cram_table->lists[i];
       cram_result = cram_results->head;
-      bmp_set(cram_lists, i);
+      bmp_set(cram_lists_done, i);
       return TRUE;
     }
   }
   for (uint i = 0; i < cram_table->lists_count; i++)
   {
-    if (!bmp_chk(cram_lists, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
+    if (!bmp_chk(cram_lists_done, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
     {
       cram_list = i;
       cram_results = cram_table->lists[i];
       cram_result = cram_results->head;
-      bmp_set(cram_lists, i);
+      bmp_set(cram_lists_done, i);
       return TRUE;
     }
   }
   for (uint i = 0; i < cram_table->lists_count; i++)
   {
-    if (!bmp_chk(cram_lists, i))
+    if (!bmp_chk(cram_lists_done, i))
     {
       pthread_mutex_lock(&cram_table->locks[i]);
       cram_list = i;
       cram_results = cram_table->lists[i];
       cram_result = cram_results->head;
-      bmp_set(cram_lists, i);
+      bmp_set(cram_lists_done, i);
       return TRUE;
     }
   }
@@ -1293,7 +1296,7 @@ int ha_cram::rnd_init(bool scan)
   cram_debug("%s", __func__);
   rnd_end();
 
-  cram_lists = bmp_alloc(cram_table->lists_count);
+  cram_lists_done = bmp_alloc(cram_table->lists_count);
 
   return 0;
 }
@@ -1309,10 +1312,157 @@ int ha_cram::rnd_end()
   cram_result  = NULL;
   cram_results = NULL;
 
-  bmp_free(cram_lists);
-  cram_lists = NULL;
+  bmp_free(cram_lists_done);
+  cram_lists_done = NULL;
 
   return 0;
+}
+
+static bool ecp_check_row(list_t *conds, CramTable *table, CramRow *row)
+{
+  bool select = TRUE;
+
+  for (node_t *node = conds->head; select && node; node = node->next)
+  {
+    CramCondition *cc = (CramCondition*) node->payload;
+
+    uchar *field  = cram_field(table, row, cc->column);
+    uchar *buffer = cram_field_buffer(field);
+    uint length   = cram_field_length(field);
+
+    int64 ni64;
+
+    CramItem *ci = cc->items && cc->items->length ? (CramItem*) cc->items->head->payload: NULL;
+
+    switch (cc->cond)
+    {
+      case CRAM_ISNULL:
+        select = cram_field_type(field) == CRAM_NULL;
+        break;
+
+      case CRAM_ISNOTNULL:
+        select = cram_field_type(field) != CRAM_NULL;
+        break;
+
+      case CRAM_EQ:
+
+        select = FALSE;
+        switch (ci->type)
+        {
+          case CRAM_INT64:
+            select = cram_field_int64(field, &ni64) && ni64 == ci->bigint;
+            break;
+
+          case CRAM_TINYSTRING:
+            select = length == ci->length
+              && memcmp(buffer, ci->buffer, length) == 0;
+            break;
+        }
+        break;
+
+      case CRAM_NE:
+
+        select = FALSE;
+        switch (ci->type)
+        {
+          case CRAM_INT64:
+            select = cram_field_int64(field, &ni64) && ni64 != ci->bigint;
+            break;
+
+          case CRAM_TINYSTRING:
+            select = length != ci->length
+              || memcmp(buffer, ci->buffer, length < ci->length ? length: ci->length) != 0;
+            break;
+        }
+        break;
+
+      case CRAM_LT:
+
+        select = FALSE;
+        switch (ci->type)
+        {
+          case CRAM_INT64:
+            select = cram_field_int64(field, &ni64) && ni64 < ci->bigint;
+            break;
+
+          case CRAM_TINYSTRING:
+            ni64 = memcmp(buffer, ci->buffer, length < ci->length ? length: ci->length);
+            if (ni64 < 0 || (ni64 == 0 && length < ci->length)) select = TRUE;
+            break;
+        }
+        break;
+
+      case CRAM_GT:
+
+        select = FALSE;
+        switch (ci->type)
+        {
+          case CRAM_INT64:
+            select = cram_field_int64(field, &ni64) && ni64 > ci->bigint;
+            break;
+
+          case CRAM_TINYSTRING:
+            ni64 = memcmp(buffer, ci->buffer, length < ci->length ? length: ci->length);
+            if (ni64 > 0 || (ni64 == 0 && length > ci->length)) select = TRUE;
+            break;
+        }
+        break;
+
+      case CRAM_LE:
+
+        select = FALSE;
+        switch (ci->type)
+        {
+          case CRAM_INT64:
+            select = cram_field_int64(field, &ni64) && ni64 <= ci->bigint;
+            break;
+
+          case CRAM_TINYSTRING:
+            ni64 = memcmp(buffer, ci->buffer, length < ci->length ? length: ci->length);
+            if (ni64 <= 0) select = TRUE;
+            break;
+        }
+        break;
+
+      case CRAM_GE:
+
+        select = FALSE;
+        switch (ci->type)
+        {
+          case CRAM_INT64:
+            select = cram_field_int64(field, &ni64) && ni64 >= ci->bigint;
+            break;
+
+          case CRAM_TINYSTRING:
+            ni64 = memcmp(buffer, ci->buffer, length < ci->length ? length: ci->length);
+            if (ni64 >= 0) select = TRUE;
+            break;
+        }
+        break;
+
+      case CRAM_IN:
+
+        select = FALSE;
+        for (node_t *inode = cc->items->head; !select && inode; inode = inode->next)
+        {
+          ci = (CramItem*) inode->payload;
+
+          switch (ci->type)
+          {
+            case CRAM_INT64:
+              select = cram_field_int64(field, &ni64) && ni64 == ci->bigint;
+              break;
+
+            case CRAM_TINYSTRING:
+              select = length == ci->length
+                && memcmp(buffer, ci->buffer, length) == 0;
+              break;
+          }
+        }
+        break;
+    }
+  }
+  return select;
 }
 
 int ha_cram::rnd_next(uchar *buf)
@@ -1379,157 +1529,16 @@ int ha_cram::rnd_next(uchar *buf)
 
     if (cram_conds && cram_conds->length)
     {
-      bool select = TRUE;
       CramRow *row = (CramRow*) cram_result->payload;
-
-      for (node_t *node = cram_conds->head; select && node; node = node->next)
-      {
-        CramCondition *cc = (CramCondition*) node->payload;
-
-        uchar *field  = cram_field(cram_table, row, cc->column);
-        uchar *buffer = cram_field_buffer(field);
-        uint length   = cram_field_length(field);
-
-        int64 ni64;
-
-        CramItem *ci = cc->items && cc->items->length ? (CramItem*) cc->items->head->payload: NULL;
-
-        switch (cc->cond)
-        {
-          case CRAM_ISNULL:
-            select = cram_field_type(field) == CRAM_NULL;
-            break;
-
-          case CRAM_ISNOTNULL:
-            select = cram_field_type(field) != CRAM_NULL;
-            break;
-
-          case CRAM_EQ:
-
-            select = FALSE;
-            switch (ci->type)
-            {
-              case CRAM_INT64:
-                select = cram_field_int64(field, &ni64) && ni64 == ci->bigint;
-                break;
-
-              case CRAM_TINYSTRING:
-                select = length == ci->length
-                  && memcmp(buffer, ci->buffer, length) == 0;
-                break;
-            }
-            break;
-
-          case CRAM_NE:
-
-            select = FALSE;
-            switch (ci->type)
-            {
-              case CRAM_INT64:
-                select = cram_field_int64(field, &ni64) && ni64 != ci->bigint;
-                break;
-
-              case CRAM_TINYSTRING:
-                select = length != ci->length
-                  || memcmp(buffer, ci->buffer, length < ci->length ? length: ci->length) != 0;
-                break;
-            }
-            break;
-
-          case CRAM_LT:
-
-            select = FALSE;
-            switch (ci->type)
-            {
-              case CRAM_INT64:
-                select = cram_field_int64(field, &ni64) && ni64 < ci->bigint;
-                break;
-
-              case CRAM_TINYSTRING:
-                ni64 = memcmp(buffer, ci->buffer, length < ci->length ? length: ci->length);
-                if (ni64 < 0 || (ni64 == 0 && length < ci->length)) select = TRUE;
-                break;
-            }
-            break;
-
-          case CRAM_GT:
-
-            select = FALSE;
-            switch (ci->type)
-            {
-              case CRAM_INT64:
-                select = cram_field_int64(field, &ni64) && ni64 > ci->bigint;
-                break;
-
-              case CRAM_TINYSTRING:
-                ni64 = memcmp(buffer, ci->buffer, length < ci->length ? length: ci->length);
-                if (ni64 > 0 || (ni64 == 0 && length > ci->length)) select = TRUE;
-                break;
-            }
-            break;
-
-          case CRAM_LE:
-
-            select = FALSE;
-            switch (ci->type)
-            {
-              case CRAM_INT64:
-                select = cram_field_int64(field, &ni64) && ni64 <= ci->bigint;
-                break;
-
-              case CRAM_TINYSTRING:
-                ni64 = memcmp(buffer, ci->buffer, length < ci->length ? length: ci->length);
-                if (ni64 <= 0) select = TRUE;
-                break;
-            }
-            break;
-
-          case CRAM_GE:
-
-            select = FALSE;
-            switch (ci->type)
-            {
-              case CRAM_INT64:
-                select = cram_field_int64(field, &ni64) && ni64 >= ci->bigint;
-                break;
-
-              case CRAM_TINYSTRING:
-                ni64 = memcmp(buffer, ci->buffer, length < ci->length ? length: ci->length);
-                if (ni64 >= 0) select = TRUE;
-                break;
-            }
-            break;
-
-          case CRAM_IN:
-
-            select = FALSE;
-            for (node_t *inode = cc->items->head; !select && inode; inode = inode->next)
-            {
-              ci = (CramItem*) inode->payload;
-
-              switch (ci->type)
-              {
-                case CRAM_INT64:
-                  select = cram_field_int64(field, &ni64) && ni64 == ci->bigint;
-                  break;
-
-                case CRAM_TINYSTRING:
-                  select = length == ci->length
-                    && memcmp(buffer, ci->buffer, length) == 0;
-                  break;
-              }
-            }
-
-            break;
-        }
-      }
-
-      if (!select)
+      if (!ecp_check_row(cram_conds, cram_table, row))
         continue;
     }
 
     break;
   }
+
+  if (cram_result)
+    counter_rows_selected++;
 
   return record_store(buf);
 }
@@ -1624,17 +1633,24 @@ void ha_cram::clear_state()
   cram_results = NULL;
   cram_result  = NULL;
   cram_list    = UINT_MAX;
-  counter_rows_touched = 0;
-  counter_rows_indexed = 0;
-  counter_rows_written = 0;
-  counter_rows_updated = 0;
-  counter_rows_deleted = 0;
+  counter_rows_touched  = 0;
+  counter_rows_selected = 0;
+  counter_rows_indexed  = 0;
+  counter_rows_written  = 0;
+  counter_rows_updated  = 0;
+  counter_rows_deleted  = 0;
 }
 
 int ha_cram::reset()
 {
-  cram_debug("%s rows t %llu i %llu w %llu u %llu d %llu",
-    __func__, counter_rows_touched, counter_rows_indexed, counter_rows_written, counter_rows_updated, counter_rows_deleted);
+  cram_debug("%s rows t %llu s %llu i %llu w %llu u %llu d %llu",
+    __func__,
+    counter_rows_touched,
+    counter_rows_selected,
+    counter_rows_indexed,
+    counter_rows_written,
+    counter_rows_updated,
+    counter_rows_deleted);
   empty_trash();
   empty_conds();
   clear_state();
@@ -1947,6 +1963,13 @@ static void cram_checkpoint_threads_update(THD * thd, struct st_mysql_sys_var *s
   cram_checkpoint_threads = n;
 }
 
+static void cram_worker_threads_update(THD * thd, struct st_mysql_sys_var *sys_var, void *var, const void *save)
+{
+  uint n = *((uint*)save);
+  *((uint*)var) = n;
+  cram_worker_threads = n;
+}
+
 static MYSQL_SYSVAR_UINT(verbose, cram_verbose, 0,
   "Debug noise to stderr.", 0, cram_verbose_update, 0, 0, 1, 1);
 
@@ -1965,6 +1988,9 @@ static MYSQL_SYSVAR_UINT(checkpoint_interval, cram_checkpoint_seconds, 0,
 static MYSQL_SYSVAR_UINT(checkpoint_threads, cram_checkpoint_threads, 0,
   "Checkpoint threads.", 0, cram_checkpoint_threads_update, 4, 2, 32, 1);
 
+static MYSQL_SYSVAR_UINT(worker_threads, cram_worker_threads, 0,
+  "Workers threads per connection.", 0, cram_worker_threads_update, 2, 2, 32, 1);
+
 static struct st_mysql_sys_var *cram_system_variables[] = {
     MYSQL_SYSVAR(verbose),
     MYSQL_SYSVAR(table_lists),
@@ -1972,6 +1998,7 @@ static struct st_mysql_sys_var *cram_system_variables[] = {
     MYSQL_SYSVAR(compress_boundary),
     MYSQL_SYSVAR(checkpoint_interval),
     MYSQL_SYSVAR(checkpoint_threads),
+    MYSQL_SYSVAR(worker_threads),
     NULL
 };
 

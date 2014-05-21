@@ -121,12 +121,13 @@ class ha_cram: public handler
   bool bulk_insert;
   uint bulk_insert_list;
 
-  bmp_t *cram_lists;
+  bmp_t *cram_lists_done;
   list_t *cram_trash;
   list_t *cram_conds;
 
   uint64 counter_rows_indexed;
   uint64 counter_rows_touched;
+  uint64 counter_rows_selected;
   uint64 counter_rows_written;
   uint64 counter_rows_updated;
   uint64 counter_rows_deleted;
