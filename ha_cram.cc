@@ -717,15 +717,24 @@ static bool cram_show_status(handlerton* hton, THD* thd, stat_print_fn* stat_pri
   str_t *str = str_alloc(100);
 
   uint64 meta = 0, data = 0;
+
+  pthread_mutex_lock(&cram_tables_lock);
+
   node_t *node = cram_tables->head;
 
   while (node)
   {
     CramTable *table = (CramTable*) node->payload;
+    table->users++;
+
+    pthread_mutex_unlock(&cram_tables_lock);
+
     meta += sizeof(CramTable) + strlen(table->name);
 
     for (uint i = 0; i < table->lists_count; i++)
     {
+      pthread_mutex_lock(&table->locks[i]);
+
       meta += sizeof(list_t*) + sizeof(list_t);
       meta += sizeof(bmp_t*) * table->width;
       meta += bmp_size(table->hints_width) * table->width;
@@ -743,13 +752,23 @@ static bool cram_show_status(handlerton* hton, THD* thd, stat_print_fn* stat_pri
 
         rnode = rnode->next;
       }
+
+      pthread_mutex_unlock(&table->locks[i]);
     }
+
+    pthread_mutex_lock(&cram_tables_lock);
+    table->users--;
+
     node = node->next;
   }
+
+  pthread_mutex_unlock(&cram_tables_lock);
 
   str_print(str, "metadata: %llu MB, data: %llu MB", meta/1024/1024, data/1024/1024);
 
   stat_print(thd, STRING_WITH_LEN("CRAM"), STRING_WITH_LEN("memory"), str->buffer, str->length);
+
+  pthread_mutex_lock(&cram_tables_lock);
 
   node = cram_tables->head;
 
@@ -758,21 +777,30 @@ static bool cram_show_status(handlerton* hton, THD* thd, stat_print_fn* stat_pri
     str_reset(str);
 
     CramTable *table = (CramTable*) node->payload;
+    table->users++;
+
+    pthread_mutex_unlock(&cram_tables_lock);
 
     str_print(str, "%s width %u lists %u hints %u compress %u", table->name, table->width, table->lists_count, table->hints_width, table->compress_boundary);
 
     uint min = UINT_MAX, max = 0, avg, tot = 0;
     for (uint i = 0; i < table->lists_count; i++)
     {
+      pthread_mutex_lock(&table->locks[i]);
+
       uint len = table->lists[i]->length;
       if (len < min) min = len;
       if (len > max) max = len;
       tot += len;
+
+      pthread_mutex_unlock(&table->locks[i]);
     }
     avg = tot / table->lists_count;
     str_print(str, " min %llu max %llu mean %llu total %llu", min, max, avg, tot);
 
     stat_print(thd, STRING_WITH_LEN("CRAM"), STRING_WITH_LEN("table"), str->buffer, str->length);
+
+    pthread_mutex_lock(&table->locks[0]);
 
     for (uint col = 0; col < table->width; col++)
     {
@@ -785,8 +813,15 @@ static bool cram_show_status(handlerton* hton, THD* thd, stat_print_fn* stat_pri
       stat_print(thd, STRING_WITH_LEN("CRAM"), STRING_WITH_LEN("table"), str->buffer, str->length);
     }
 
+    pthread_mutex_unlock(&table->locks[0]);
+
+    pthread_mutex_lock(&cram_tables_lock);
+    table->users--;
+
     node = node->next;
   }
+
+  pthread_mutex_unlock(&cram_tables_lock);
 
   str_free(str);
 
