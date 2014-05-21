@@ -1209,6 +1209,11 @@ int ha_cram::delete_row(const uchar *buf)
 
   uchar *row = (uchar*) cram_result->payload;
 
+  // We're about to delete cram_result, which would make any
+  // later call to rnd_next() perform an invalid ->next read.
+  memmove(&cram_node, cram_result, sizeof(node_t));
+  cram_result = &cram_node;
+
   if (cram_list < UINT_MAX)
   {
     list_delete(cram_table->lists[cram_list], row);
@@ -1220,7 +1225,7 @@ int ha_cram::delete_row(const uchar *buf)
     {
       pthread_mutex_lock(&cram_table->locks[list]);
       list_delete(cram_table->lists[list], row);
-      cram_table->changes[cram_list]++;
+      cram_table->changes[list]++;
       pthread_mutex_unlock(&cram_table->locks[list]);
     }
   }

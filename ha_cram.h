@@ -124,6 +124,7 @@ class ha_cram: public handler
   bmp_t *cram_lists_done;
   list_t *cram_trash;
   list_t *cram_conds;
+  node_t cram_node;
 
   uint64 counter_rows_indexed;
   uint64 counter_rows_touched;
