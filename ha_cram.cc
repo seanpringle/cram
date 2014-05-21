@@ -910,6 +910,8 @@ int ha_cram::open(const char *name, int mode, uint test_if_locked)
 
   pthread_mutex_unlock(&cram_tables_lock);
 
+  ref_length = sizeof(CramPosition);
+
   return cram_table ? 0: -1;
 }
 
@@ -1548,15 +1550,10 @@ void ha_cram::position(const uchar *record)
 
   use_trash();
 
-  CramPosition *cp = (CramPosition*) cram_alloc(sizeof(CramPosition));
-
-  *((CramPosition**)ref) = cp;
-  ref_length = sizeof(CramPosition);
+  CramPosition *cp = (CramPosition*) ref;
 
   cp->list = cram_list;
   cp->row  = (CramRow*) cram_result->payload;
-
-  list_insert_head(cram_trash, cp);
 }
 
 int ha_cram::rnd_pos(uchar *buf, uchar *pos)
