@@ -259,11 +259,6 @@ static bool list_is_empty(list_t *list)
   return list->head ? FALSE: TRUE;
 }
 
-static uint64 list_length(list_t *list)
-{
-  return list->length;
-}
-
 static void list_insert_head(list_t *list, void *item)
 {
   node_t *node = (node_t*) cram_alloc(sizeof(node_t));
@@ -546,6 +541,15 @@ static CramTable* cram_table_open(const char *name, uint width)
 
     list_insert_head(cram_tables, table);
 
+    uint64 meta_size = sizeof(CramTable) + strlen(table->name) + 1;
+    uint64 data_size = 0;
+    uint64 row_count = 0;
+
+    meta_size += sizeof(list_t*) * table->lists_count;
+    meta_size += (sizeof(bmp_t*) + bmp_size(table->hints_width)) * table->lists_count * table->width;
+    meta_size += sizeof(uint) * table->lists_count; // changes
+    meta_size += sizeof(pthread_mutex_t) * table->lists_count; // locks
+
     if (data)
     {
       uint list = 0; uint64 width = 0;
@@ -565,9 +569,17 @@ static CramTable* cram_table_open(const char *name, uint width)
         list++;
         if (list == table->lists_count)
           list = 0;
+
+        meta_size += sizeof(node_t);
+        data_size += width;
+        row_count++;
       }
       fclose(data);
     }
+
+    table->meta_size = meta_size;
+    table->data_size = data_size;
+    table->row_count = row_count;
 
     thr_lock_init(&table->mysql_lock);
   }
@@ -618,10 +630,23 @@ static void* cram_checkpointer(void *p)
   fwrite(&table->hints_width, 1, sizeof(size_t), data);
   fwrite(&table->compress_boundary, 1, sizeof(size_t), data);
 
+  uint64 meta_size = sizeof(CramTable) + strlen(table->name) + 1;
+  uint64 data_size = 0;
+  uint64 row_count = 0;
+
+  meta_size += sizeof(list_t*) * table->lists_count;
+  meta_size += (sizeof(bmp_t*) + bmp_size(table->hints_width)) * table->lists_count * table->width;
+  meta_size += sizeof(uint) * table->lists_count; // changes
+  meta_size += sizeof(pthread_mutex_t) * table->lists_count; // locks
+
   for (uint li = 0; li < table->lists_count; li++)
   {
     list_t *list = table->lists[li];
     pthread_mutex_lock(&table->locks[li]);
+
+    meta_size += sizeof(node_t) * list->length;
+
+    row_count += list->length;
 
     for (node_t *node = list->head; node; node = node->next)
     {
@@ -633,12 +658,18 @@ static void* cram_checkpointer(void *p)
 
       fwrite(&width, 1, sizeof(uint64), data);
       fwrite(row, 1, width, data);
+
+      data_size += width;
     }
 
     pthread_mutex_unlock(&table->locks[li]);
   }
   fclose(data);
   rename(nname, fname);
+
+  table->meta_size = meta_size;
+  table->data_size = data_size;
+  table->row_count = row_count;
 
   return NULL;
 }
@@ -725,40 +756,8 @@ static bool cram_show_status(handlerton* hton, THD* thd, stat_print_fn* stat_pri
   while (node)
   {
     CramTable *table = (CramTable*) node->payload;
-    table->users++;
-
-    pthread_mutex_unlock(&cram_tables_lock);
-
-    meta += sizeof(CramTable) + strlen(table->name);
-
-    for (uint i = 0; i < table->lists_count; i++)
-    {
-      pthread_mutex_lock(&table->locks[i]);
-
-      meta += sizeof(list_t*) + sizeof(list_t);
-      meta += sizeof(bmp_t*) * table->width;
-      meta += bmp_size(table->hints_width) * table->width;
-      meta += sizeof(uint) * table->width; // changes
-      meta += sizeof(pthread_mutex_t);
-
-      node_t *rnode = table->lists[i]->head;
-
-      while (rnode)
-      {
-        meta += sizeof(node_t);
-
-        for (uint col = 0; col < table->width; col++)
-          data += cram_field_width(cram_field(table, (uchar*) rnode->payload, col));
-
-        rnode = rnode->next;
-      }
-
-      pthread_mutex_unlock(&table->locks[i]);
-    }
-
-    pthread_mutex_lock(&cram_tables_lock);
-    table->users--;
-
+    meta += table->meta_size;
+    data += table->data_size;
     node = node->next;
   }
 
@@ -1616,19 +1615,11 @@ int ha_cram::info(uint flag)
 
   if (flag & HA_STATUS_VARIABLE)
   {
-    uint64 rows = 0;
-    for (uint i = 0; i < cram_table->lists_count; i++)
-    {
-      pthread_mutex_lock(&cram_table->locks[i]);
-      rows += list_length(cram_table->lists[i]),
-      pthread_mutex_unlock(&cram_table->locks[i]);
-    }
-
-    stats.records = rows;
+    stats.records = cram_table->row_count;
     stats.deleted = 0;
-    stats.data_file_length  = 0;
-    stats.index_file_length = 0;
-    stats.mean_rec_length   = 0;
+    stats.data_file_length  = cram_table->data_size;
+    stats.index_file_length = cram_table->meta_size;
+    stats.mean_rec_length   = cram_table->row_count ? cram_table->data_size / cram_table->row_count: 0;
   }
 
   return 0;

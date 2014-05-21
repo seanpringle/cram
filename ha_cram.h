@@ -58,6 +58,9 @@ typedef struct _CramTable {
   bmp_t ***hints;
   uint *changes;
   bool dropping;
+  uint64 row_count;
+  uint64 meta_size;
+  uint64 data_size;
   THR_LOCK mysql_lock;
 } CramTable;
 
