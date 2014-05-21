@@ -58,6 +58,7 @@ typedef struct _CramTable {
   bmp_t ***hints;
   uint *changes;
   bool dropping;
+  THR_LOCK mysql_lock;
 } CramTable;
 
 typedef struct _CramPosition {

@@ -53,8 +53,6 @@ struct ha_field_option_struct{};
 ha_create_table_option cram_table_option_list[] = { HA_TOPTION_END };
 ha_create_table_option cram_field_option_list[] = { HA_FOPTION_END };
 
-static THR_LOCK mysql_lock;
-
 static uint cram_verbose;
 
 static void cram_note(const char *format, ...)
@@ -570,6 +568,8 @@ static CramTable* cram_table_open(const char *name, uint width)
       }
       fclose(data);
     }
+
+    thr_lock_init(&table->mysql_lock);
   }
 
   return table;
@@ -596,6 +596,8 @@ static void cram_table_drop(CramTable *table, bool hard)
 
     cram_free(table->hints[i]);
   }
+
+  thr_lock_delete(&table->mysql_lock);
 
   cram_free(table->name);
   list_delete(cram_tables, table);
@@ -802,7 +804,6 @@ static int cram_init_func(void *p)
   cram_hton->field_options = cram_field_option_list;
   cram_hton->show_status = cram_show_status;
 
-  thr_lock_init(&mysql_lock);
 
   pthread_mutex_init(&cram_tables_lock, NULL);
   pthread_create(&checkpoint_thread, NULL, cram_checkpoint, NULL);
@@ -901,11 +902,10 @@ int ha_cram::open(const char *name, int mode, uint test_if_locked)
   cram_debug("%s %s", __func__, name);
   reset();
 
-  thr_lock_data_init(&mysql_lock, &lock, NULL);
-
   pthread_mutex_lock(&cram_tables_lock);
 
   cram_table = cram_table_open(name, table->s->fields);
+  thr_lock_data_init(&cram_table->mysql_lock, &lock, NULL);
   cram_table->users++;
 
   pthread_mutex_unlock(&cram_tables_lock);
@@ -1214,22 +1214,10 @@ int ha_cram::delete_row(const uchar *buf)
   memmove(&cram_node, cram_result, sizeof(node_t));
   cram_result = &cram_node;
 
-  if (cram_list < UINT_MAX)
-  {
-    list_delete(cram_table->lists[cram_list], row);
-    cram_table->changes[cram_list]++;
-  }
-  else
-  {
-    for (uint list = 0; list < cram_table->lists_count; list++)
-    {
-      pthread_mutex_lock(&cram_table->locks[list]);
-      list_delete(cram_table->lists[list], row);
-      cram_table->changes[list]++;
-      pthread_mutex_unlock(&cram_table->locks[list]);
-    }
-  }
+  list_delete(cram_table->lists[cram_list], row);
+  cram_table->changes[cram_list]++;
   cram_free(row);
+
   counter_rows_deleted++;
   return 0;
 }
