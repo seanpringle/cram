@@ -133,7 +133,7 @@ static size_t cram_deflate(uchar *data, size_t width)
   stream.zfree = Z_NULL;
   stream.opaque = Z_NULL;
 
-  err = deflateInit2(&stream, Z_BEST_SPEED, Z_DEFLATED, 15, 9, Z_DEFAULT_STRATEGY);
+  err = deflateInit2(&stream, Z_BEST_SPEED, Z_DEFLATED, 15, 9, Z_HUFFMAN_ONLY);
   if (err != Z_OK) goto oops;
 
   err = deflate(&stream, Z_FINISH);
@@ -1189,7 +1189,6 @@ int ha_cram::write_row(uchar *buf)
 
   uint list = 0;
   bool lock = FALSE;
-
   for (uint i = 0; !lock && i < 3; i++)
   {
     long r; lrand48_r(&cram_rand, &r);
@@ -1250,42 +1249,34 @@ bool ha_cram::next_list()
   if (cram_list < UINT_MAX)
     pthread_mutex_unlock(&cram_table->locks[cram_list]);
 
-  uint *lists = (uint*) cram_alloc(sizeof(uint) * cram_table->lists_count);
-  uint todo = 0;
+  for (uint i = 0; i < cram_table->lists_count; i++)
+  {
+    if (!bmp_chk(cram_lists_done, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
+    {
+      cram_list = i;
+      cram_results = cram_table->lists[i];
+      cram_result = cram_results->head;
+      bmp_set(cram_lists_done, i);
+      return TRUE;
+    }
+  }
 
   for (uint i = 0; i < cram_table->lists_count; i++)
   {
     if (!bmp_chk(cram_lists_done, i))
     {
-      if (pthread_mutex_trylock(&cram_table->locks[i]) == 0)
-      {
-        cram_list = i;
-        cram_results = cram_table->lists[i];
-        cram_result = cram_results->head;
-        bmp_set(cram_lists_done, i);
-        cram_free(lists);
-        return TRUE;
-      }
-      lists[todo++] = i;
+      pthread_mutex_lock(&cram_table->locks[i]);
+      cram_list = i;
+      cram_results = cram_table->lists[i];
+      cram_result = cram_results->head;
+      bmp_set(cram_lists_done, i);
+      return TRUE;
     }
-  }
-
-  if (todo)
-  {
-    long r; lrand48_r(&cram_rand, &r);
-    cram_list = lists[r % todo];
-    pthread_mutex_lock(&cram_table->locks[cram_list]);
-    cram_results = cram_table->lists[cram_list];
-    cram_result  = cram_results->head;
-    bmp_set(cram_lists_done, cram_list);
-    cram_free(lists);
-    return TRUE;
   }
 
   cram_list    = UINT_MAX;
   cram_result  = NULL;
   cram_results = NULL;
-  cram_free(lists);
   return FALSE;
 }
 
