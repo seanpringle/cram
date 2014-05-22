@@ -123,7 +123,6 @@ class ha_cram: public handler
   node_t *cram_result;
 
   bool bulk_insert;
-  uint bulk_insert_list;
 
   bmp_t *cram_lists_done;
   list_t *cram_trash;
@@ -136,6 +135,8 @@ class ha_cram: public handler
   uint64 counter_rows_written;
   uint64 counter_rows_updated;
   uint64 counter_rows_deleted;
+
+  struct drand48_data cram_rand;
 
 public:
   ha_cram(handlerton *hton, TABLE_SHARE *table_arg);
@@ -198,7 +199,6 @@ public:
   uchar* record_place(uchar *buf);
 
   bool next_list();
-  uint shortest_list();
   void empty_trash();
   void use_trash();
   void empty_conds();

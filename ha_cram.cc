@@ -875,7 +875,6 @@ ha_cram::ha_cram(handlerton *hton, TABLE_SHARE *table_arg)
   cram_trash = NULL;
   cram_lists_done = NULL;
   bulk_insert = FALSE;
-  bulk_insert_list = 0;
   clear_state();
 }
 
@@ -969,7 +968,6 @@ int ha_cram::close(void)
 void ha_cram::start_bulk_insert(ha_rows rows, uint flags)
 {
   cram_debug("%s", __func__);
-  bulk_insert_list = shortest_list();
   bulk_insert = TRUE;
 }
 
@@ -1164,30 +1162,6 @@ uchar* ha_cram::record_place(uchar *buf)
   return row;
 }
 
-uint ha_cram::shortest_list()
-{
-  if (bulk_insert)
-  {
-    uint list = bulk_insert_list++;
-    if (bulk_insert_list == cram_table->lists_count)
-      bulk_insert_list = 0;
-    return list;
-  }
-
-  uint list = 0;
-  uint64 length = (~0ULL);
-  for (uint i = 0; i < cram_table->lists_count; i++)
-  {
-    if (pthread_mutex_trylock(&cram_table->locks[i]) == 0)
-    {
-      if (cram_table->lists[i]->length < length)
-        list = i;
-      pthread_mutex_unlock(&cram_table->locks[i]);
-    }
-  }
-  return list;
-}
-
 void ha_cram::update_list_hints(uint list, CramRow *row)
 {
   cram_row_index(cram_table, list, row);
@@ -1201,7 +1175,9 @@ int ha_cram::write_row(uchar *buf)
   my_bitmap_map *org_bitmap = dbug_tmp_use_all_columns(table, table->read_set);
 
   uchar *row = record_place(buf);
-  uint list = shortest_list();
+
+  long r; lrand48_r(&cram_rand, &r);
+  uint list = r % cram_table->lists_count;
 
   pthread_mutex_lock(&cram_table->locks[list]);
   list_insert_head(cram_table->lists[list], row);
@@ -1221,21 +1197,9 @@ int ha_cram::update_row(const uchar *old_data, uchar *new_data)
 
   uchar *new_row = record_place(new_data);
   delete_row(old_data);
-  uint list = cram_list;
 
-  if (cram_list == UINT_MAX)
-  {
-    list = shortest_list();
-    pthread_mutex_lock(&cram_table->locks[list]);
-  }
-
-  list_insert_head(cram_table->lists[list], new_row);
-  update_list_hints(list, new_row);
-
-  if (cram_list == UINT_MAX)
-  {
-    pthread_mutex_unlock(&cram_table->locks[list]);
-  }
+  list_insert_head(cram_table->lists[cram_list], new_row);
+  update_list_hints(cram_list, new_row);
 
   dbug_tmp_restore_column_map(table->read_set, org_bitmap);
   counter_rows_updated++;
@@ -1641,6 +1605,7 @@ void ha_cram::clear_state()
   counter_rows_written  = 0;
   counter_rows_updated  = 0;
   counter_rows_deleted  = 0;
+  srand48_r(time(NULL), &cram_rand);
 }
 
 int ha_cram::reset()
