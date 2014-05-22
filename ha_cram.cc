@@ -1240,6 +1240,10 @@ bool ha_cram::next_list()
 {
   if (cram_list < UINT_MAX)
     pthread_mutex_unlock(&cram_table->locks[cram_list]);
+  else {
+    long r; lrand48_r(&cram_rand, &r);
+    cram_list = r % cram_table->lists_count;
+  }
 
   for (uint i = cram_list+1; i < cram_table->lists_count; i++)
   {
