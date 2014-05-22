@@ -1221,16 +1221,21 @@ int ha_cram::update_row(const uchar *old_data, uchar *new_data)
 
   uchar *new_row = record_place(new_data);
   delete_row(old_data);
-  uint list = shortest_list();
+  uint list = cram_list;
 
-  if (cram_list != list)
+  if (cram_list == UINT_MAX)
+  {
+    list = shortest_list();
     pthread_mutex_lock(&cram_table->locks[list]);
+  }
 
   list_insert_head(cram_table->lists[list], new_row);
   update_list_hints(list, new_row);
 
-  if (cram_list != list)
+  if (cram_list == UINT_MAX)
+  {
     pthread_mutex_unlock(&cram_table->locks[list]);
+  }
 
   dbug_tmp_restore_column_map(table->read_set, org_bitmap);
   counter_rows_updated++;
