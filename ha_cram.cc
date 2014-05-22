@@ -1090,10 +1090,19 @@ uchar* ha_cram::record_place(uchar *buf)
       String tmp(pad, sizeof(pad), &my_charset_bin);
       field->val_str(&tmp, &tmp);
 
-      if (tmp.length() < cram_table->compress_boundary)
+      if (tmp.length() < cram_table->compress_boundary && tmp.length() < 256)
       {
         real_lengths[col] = tmp.length();
         length += tmp.length() + sizeof(uint8_t);
+      }
+      else
+      if (tmp.length() < cram_table->compress_boundary)
+      {
+        real_lengths[col] = tmp.length();
+        comp_lengths[col] = real_lengths[col];
+        compressed[col] = (uchar*) cram_alloc(real_lengths[col]);
+        memmove(compressed[col], tmp.ptr(), real_lengths[col]);
+        length += comp_lengths[col] + sizeof(uint) + sizeof(uint);
       }
       else
       {
@@ -1331,6 +1340,10 @@ static bool ecp_check_row(list_t *conds, CramTable *table, CramRow *row)
     uchar *buffer = cram_field_buffer(field);
     uint length   = cram_field_length(field);
 
+    // compressed fields go no matter what
+    if (cram_field_type(field) == CRAM_STRING && cram_field_length_string(field) != length)
+      break;
+
     int64 ni64;
 
     CramItem *ci = cc->items && cc->items->length ? (CramItem*) cc->items->head->payload: NULL;
@@ -1477,6 +1490,9 @@ int ha_cram::rnd_next(uchar *buf)
     if (!cram_result)
     {
       next_list();
+
+      if (cram_results && !cram_result)
+        continue;
 
       if (cram_results && cram_table->changes[cram_list] > cram_results->length/4)
       {
@@ -1799,7 +1815,7 @@ void ha_cram::check_condition ( const COND * cond )
         cram_debug("%s ECP EQ/NE/LT/GT/LE/GE INT %lld", __func__, ci->bigint);
       }
       else
-      if ((str = arg->val_str(&tmp)) && str->length() < cram_table->compress_boundary)
+      if ((str = arg->val_str(&tmp)) && str->length() < 256 && str->length() < cram_table->compress_boundary)
       {
         ci->type = CRAM_TINYSTRING;
         ci->length = str->length();
@@ -1848,7 +1864,7 @@ void ha_cram::check_condition ( const COND * cond )
           ci->hashval = cram_hash_int64(ci->bigint);
         }
         else
-        if ((str = arg->val_str(&tmp)) && str->length() < cram_table->compress_boundary)
+        if ((str = arg->val_str(&tmp)) && str->length() < 256 && str->length() < cram_table->compress_boundary)
         {
           ci->type = CRAM_TINYSTRING;
           ci->length = str->length();
@@ -1981,7 +1997,7 @@ static MYSQL_SYSVAR_UINT(table_list_hints, cram_table_list_hints, 0,
   "Width of table list hints bitmap.", 0, cram_table_list_hints_update, 512, 128, UINT_MAX, 1);
 
 static MYSQL_SYSVAR_UINT(compress_boundary, cram_compress_boundary, 0,
-  "Compress strings longer than N bytes.", 0, cram_compress_boundary_update, 128, 32, 256, 1);
+  "Compress strings longer than N bytes.", 0, cram_compress_boundary_update, 128, 32, UINT_MAX, 1);
 
 static MYSQL_SYSVAR_UINT(checkpoint_interval, cram_checkpoint_seconds, 0,
   "Checkpoint interval.", 0, cram_checkpoint_seconds_update, 60, 10, 300, 1);
