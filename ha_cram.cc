@@ -1794,7 +1794,7 @@ void ha_cram::check_condition ( const COND * cond )
 
       for (uint ai = 1; ai < func->argument_count(); ai++)
       {
-        if (!args[1]->const_item())
+        if (!args[ai]->const_item())
           return;
         if (args[ai]->result_type() != INT_RESULT && args[ai]->result_type() != STRING_RESULT)
           return;
