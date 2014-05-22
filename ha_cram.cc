@@ -44,6 +44,9 @@ bool checkpoint_done;
 bool checkpoint_asap;
 pthread_t checkpoint_thread;
 
+uint64 cram_seed;
+pthread_mutex_t cram_seed_lock;
+
 static handler *cram_create_handler(handlerton *hton, TABLE_SHARE *table, MEM_ROOT *mem_root);
 
 handlerton *cram_hton;
@@ -838,8 +841,10 @@ static int cram_init_func(void *p)
   cram_hton->field_options = cram_field_option_list;
   cram_hton->show_status = cram_show_status;
 
+  cram_seed = 1;
 
   pthread_mutex_init(&cram_tables_lock, NULL);
+  pthread_mutex_init(&cram_seed_lock, NULL);
   pthread_create(&checkpoint_thread, NULL, cram_checkpoint, NULL);
 
   cram_tables = list_alloc();
@@ -853,6 +858,7 @@ static int cram_done_func(void *p)
   pthread_join(checkpoint_thread, NULL);
 
   pthread_mutex_destroy(&cram_tables_lock);
+  pthread_mutex_destroy(&cram_seed_lock);
 
   while (!list_is_empty(cram_tables))
     cram_table_drop((CramTable*)list_remove_head(cram_tables), FALSE);
@@ -1605,7 +1611,9 @@ void ha_cram::clear_state()
   counter_rows_written  = 0;
   counter_rows_updated  = 0;
   counter_rows_deleted  = 0;
-  srand48_r(time(NULL), &cram_rand);
+  pthread_mutex_lock(&cram_seed_lock);
+  srand48_r(cram_seed++, &cram_rand);
+  pthread_mutex_unlock(&cram_seed_lock);
 }
 
 int ha_cram::reset()
@@ -1863,7 +1871,7 @@ const COND * ha_cram::cond_push ( const COND * cond )
     check_condition(cond);
   }
 
-  return NULL;
+  return cram_conds->length ? NULL: cond;
 }
 
 THR_LOCK_DATA **ha_cram::store_lock(THD *thd, THR_LOCK_DATA **to, enum thr_lock_type lock_type)
