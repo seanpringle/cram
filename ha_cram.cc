@@ -642,7 +642,9 @@ static void* cram_checkpointer(void *p)
   meta_size += sizeof(uint) * table->lists_count; // changes
   meta_size += sizeof(pthread_mutex_t) * table->lists_count; // locks
 
-  for (uint li = 0; li < table->lists_count; li++)
+  // Walk lists in reverse order. Theory is this makes it harder for
+  // queries to fetch up in line behind the checkpoint threads.
+  for (int li = table->lists_count-1; li >= 0; li--)
   {
     list_t *list = table->lists[li];
     pthread_mutex_lock(&table->locks[li]);
@@ -654,10 +656,13 @@ static void* cram_checkpointer(void *p)
     for (node_t *node = list->head; node; node = node->next)
     {
       CramRow *row = (CramRow*) node->payload;
-      uint64 width = 0;
+
+      uchar *field = row;
 
       for (uint col = 0; col < table->width; col++)
-        width += cram_field_width(cram_field(table, row, col));
+        field += cram_field_width(field);
+
+      uint64 width = field - row;
 
       fwrite(&width, 1, sizeof(uint64), data);
       fwrite(row, 1, width, data);
