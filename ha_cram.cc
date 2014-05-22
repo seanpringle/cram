@@ -1734,8 +1734,9 @@ void ha_cram::check_condition ( const COND * cond )
     else
     if ( func->argument_count() == 2
       && args[0]->type() == COND::FIELD_ITEM
+      && args[1]->const_item()
       && !args[1]->is_null()
-      && (args[0]->result_type() == INT_RESULT || args[0]->result_type() == STRING_RESULT)
+      && (args[1]->result_type() == INT_RESULT || args[1]->result_type() == STRING_RESULT)
       && ( func->functype() == Item_func::EQ_FUNC
         || func->functype() == Item_func::NE_FUNC
         || func->functype() == Item_func::LT_FUNC
@@ -1793,6 +1794,8 @@ void ha_cram::check_condition ( const COND * cond )
 
       for (uint ai = 1; ai < func->argument_count(); ai++)
       {
+        if (!args[1]->const_item())
+          return;
         if (args[ai]->result_type() != INT_RESULT && args[ai]->result_type() != STRING_RESULT)
           return;
       }
