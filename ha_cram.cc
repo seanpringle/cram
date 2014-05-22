@@ -1249,6 +1249,18 @@ bool ha_cram::next_list()
   if (cram_list < UINT_MAX)
     pthread_mutex_unlock(&cram_table->locks[cram_list]);
 
+  for (uint i = cram_list+1; i < cram_table->lists_count; i++)
+  {
+    if (!bmp_chk(cram_lists_done, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
+    {
+      cram_list = i;
+      cram_results = cram_table->lists[i];
+      cram_result = cram_results->head;
+      bmp_set(cram_lists_done, i);
+      return TRUE;
+    }
+  }
+
   for (uint i = 0; i < cram_table->lists_count; i++)
   {
     if (!bmp_chk(cram_lists_done, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
