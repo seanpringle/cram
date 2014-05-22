@@ -36,6 +36,7 @@ uint cram_compress_boundary;
 uint cram_checkpoint_seconds;
 uint cram_checkpoint_threads;
 uint cram_worker_threads;
+uint cram_lock_method;
 
 list_t *cram_tables;
 pthread_mutex_t cram_tables_lock;
@@ -1189,8 +1190,21 @@ int ha_cram::write_row(uchar *buf)
 
   long r; lrand48_r(&cram_rand, &r);
   uint list = r % cram_table->lists_count;
+  bool lock = pthread_mutex_trylock(&cram_table->locks[list]) == 0;
 
-  pthread_mutex_lock(&cram_table->locks[list]);
+  if (!lock && cram_lock_method & (1<<3))
+  {
+    for (uint i = 0; !lock && i < 3; i++)
+    {
+      lrand48_r(&cram_rand, &r);
+      list = r % cram_table->lists_count;
+      lock = pthread_mutex_trylock(&cram_table->locks[list]) == 0;
+    }
+  }
+
+  if (!lock)
+    pthread_mutex_lock(&cram_table->locks[list]);
+
   list_insert_head(cram_table->lists[list], row);
   update_list_hints(list, row);
   pthread_mutex_unlock(&cram_table->locks[list]);
@@ -1240,31 +1254,39 @@ bool ha_cram::next_list()
 {
   if (cram_list < UINT_MAX)
     pthread_mutex_unlock(&cram_table->locks[cram_list]);
-  else {
+  else
+  if (cram_lock_method & (1<<0))
+  {
     long r; lrand48_r(&cram_rand, &r);
     cram_list = r % cram_table->lists_count;
   }
 
-  for (uint i = cram_list+1; i < cram_table->lists_count; i++)
+  if (cram_lock_method & (1<<1))
   {
-    if (!bmp_chk(cram_lists_done, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
+    for (uint i = cram_list+1; i < cram_table->lists_count; i++)
     {
-      cram_list = i;
-      cram_results = cram_table->lists[i];
-      cram_result = cram_results->head;
-      bmp_set(cram_lists_done, i);
-      return TRUE;
+      if (!bmp_chk(cram_lists_done, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
+      {
+        cram_list = i;
+        cram_results = cram_table->lists[i];
+        cram_result = cram_results->head;
+        bmp_set(cram_lists_done, i);
+        return TRUE;
+      }
     }
   }
-  for (uint i = 0; i < cram_table->lists_count; i++)
+  if (cram_lock_method & (1<<2))
   {
-    if (!bmp_chk(cram_lists_done, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
+    for (uint i = 0; i < cram_table->lists_count; i++)
     {
-      cram_list = i;
-      cram_results = cram_table->lists[i];
-      cram_result = cram_results->head;
-      bmp_set(cram_lists_done, i);
-      return TRUE;
+      if (!bmp_chk(cram_lists_done, i) && pthread_mutex_trylock(&cram_table->locks[i]) == 0)
+      {
+        cram_list = i;
+        cram_results = cram_table->lists[i];
+        cram_result = cram_results->head;
+        bmp_set(cram_lists_done, i);
+        return TRUE;
+      }
     }
   }
   for (uint i = 0; i < cram_table->lists_count; i++)
@@ -1964,6 +1986,13 @@ static void cram_worker_threads_update(THD * thd, struct st_mysql_sys_var *sys_v
   cram_worker_threads = n;
 }
 
+static void cram_lock_method_update(THD * thd, struct st_mysql_sys_var *sys_var, void *var, const void *save)
+{
+  uint n = *((uint*)save);
+  *((uint*)var) = n;
+  cram_lock_method = n;
+}
+
 static MYSQL_SYSVAR_UINT(verbose, cram_verbose, 0,
   "Debug noise to stderr.", 0, cram_verbose_update, 0, 0, 1, 1);
 
@@ -1985,6 +2014,9 @@ static MYSQL_SYSVAR_UINT(checkpoint_threads, cram_checkpoint_threads, 0,
 static MYSQL_SYSVAR_UINT(worker_threads, cram_worker_threads, 0,
   "Workers threads per connection.", 0, cram_worker_threads_update, 2, 2, 32, 1);
 
+static MYSQL_SYSVAR_UINT(lock_method, cram_lock_method, 0,
+  "debug setting.", 0, cram_lock_method_update, UINT_MAX, 0, UINT_MAX, 1);
+
 static struct st_mysql_sys_var *cram_system_variables[] = {
     MYSQL_SYSVAR(verbose),
     MYSQL_SYSVAR(table_lists),
@@ -1993,6 +2025,7 @@ static struct st_mysql_sys_var *cram_system_variables[] = {
     MYSQL_SYSVAR(checkpoint_interval),
     MYSQL_SYSVAR(checkpoint_threads),
     MYSQL_SYSVAR(worker_threads),
+    MYSQL_SYSVAR(lock_method),
     NULL
 };
 
