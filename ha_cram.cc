@@ -623,7 +623,8 @@ static void cram_table_drop(CramTable *table, bool hard)
 
 static void* cram_checkpointer(void *p)
 {
-  CramTable *table = (CramTable*) p;
+  CramCheckpoint *checkpoint = (CramCheckpoint*) p;
+  CramTable *table = checkpoint->table;
 
   char nname[1024], fname[1024];
   snprintf(fname, sizeof(fname), "%s.cram", table->name);
@@ -685,6 +686,7 @@ static void* cram_checkpointer(void *p)
   table->row_count = row_count;
 
   cram_free(output);
+  checkpoint->done = TRUE;
 
   return NULL;
 }
@@ -724,37 +726,81 @@ static void* cram_checkpoint(void *p)
 
     pthread_mutex_unlock(&cram_tables_lock);
 
-    uint spawned = 0;
-    pthread_t writers[cram_checkpoint_threads];
+    CramCheckpoint writers[cram_checkpoint_threads];
+
+    for (uint i = 0; i < cram_checkpoint_threads; i++)
+    {
+      writers[i].idle = TRUE;
+      pthread_mutex_init(&writers[i].mutex, NULL);
+    }
 
     for (node_t *tnode = tables->head; tnode; tnode = tnode->next)
     {
       CramTable *table = (CramTable*) tnode->payload;
 
-      if (spawned == cram_checkpoint_threads)
+      bool spawned = FALSE;
+
+      while (!spawned)
       {
-        for (uint i = 0; i < spawned; i++)
-          pthread_join(writers[i], NULL);
-        spawned = 0;
+        for (uint i = 0; !spawned && i < cram_checkpoint_threads; i++)
+        {
+          pthread_mutex_lock(&writers[i].mutex);
+
+          if (writers[i].done)
+          {
+            pthread_mutex_unlock(&writers[i].mutex);
+            pthread_join(writers[i].thread, NULL);
+            pthread_mutex_lock(&writers[i].mutex);
+            writers[i].idle = TRUE;
+            writers[i].done = FALSE;
+
+            pthread_mutex_lock(&cram_tables_lock);
+            writers[i].table->users--;
+            list_delete(tables, writers[i].table);
+            pthread_mutex_unlock(&cram_tables_lock);
+          }
+
+          if (writers[i].idle)
+          {
+            writers[i].idle  = FALSE;
+            writers[i].done  = FALSE;
+            writers[i].table = table;
+            pthread_create(&writers[i].thread, NULL, cram_checkpointer, &writers[i]);
+            spawned = TRUE;
+          }
+
+          pthread_mutex_unlock(&writers[i].mutex);
+        }
+        usleep(1000);
+      }
+    }
+
+    for (uint i = 0; i < cram_checkpoint_threads; i++)
+    {
+      pthread_mutex_lock(&writers[i].mutex);
+
+      if (!writers[i].idle && !writers[i].done)
+      {
+        pthread_mutex_unlock(&writers[i].mutex);
+        pthread_join(writers[i].thread, NULL);
+        pthread_mutex_lock(&writers[i].mutex);
+        writers[i].idle = TRUE;
+        writers[i].done = FALSE;
+
+        pthread_mutex_lock(&cram_tables_lock);
+        writers[i].table->users--;
+        list_delete(tables, writers[i].table);
+        pthread_mutex_unlock(&cram_tables_lock);
       }
 
-      pthread_create(&writers[spawned++], NULL, cram_checkpointer, table);
+      pthread_mutex_unlock(&writers[i].mutex);
+      pthread_mutex_destroy(&writers[i].mutex);
     }
-
-    for (uint i = 0; i < spawned; i++)
-      pthread_join(writers[i], NULL);
-
-    pthread_mutex_lock(&cram_tables_lock);
-
-    while (tables->length)
-    {
-      CramTable *table = (CramTable*) list_remove_head(tables);
-      table->users--;
-    }
-
-    pthread_mutex_unlock(&cram_tables_lock);
 
     pthread_mutex_unlock(&cram_checkpoint_lock);
+
+    if (tables->length)
+      cram_error("checkpoint table list not empty");
 
     gettimeofday(&time_stop, NULL);
     cram_checkpoint_duration_usec = (time_stop.tv_sec * 1000000 + time_stop.tv_usec)

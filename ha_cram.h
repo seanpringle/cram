@@ -83,6 +83,14 @@ typedef struct _CramCondition {
   list_t *items;
 } CramCondition;
 
+typedef struct _CramCheckpoint {
+  CramTable *table;
+  bool done;
+  bool idle;
+  pthread_t thread;
+  pthread_mutex_t mutex;
+} CramCheckpoint;
+
 enum {
   CRAM_NULL=0,
   CRAM_INT08,
