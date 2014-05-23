@@ -677,7 +677,6 @@ static void* cram_checkpointer(void *p)
     }
 
     pthread_mutex_unlock(&table->locks[li]);
-    usleep(10);
   }
   fclose(data);
   rename(nname, fname);
@@ -2084,7 +2083,7 @@ static MYSQL_SYSVAR_UINT(checkpoint_threads, cram_checkpoint_threads, 0,
   "Checkpoint threads.", 0, cram_checkpoint_threads_update, 4, 2, 32, 1);
 
 static MYSQL_SYSVAR_UINT(checkpoint_buffer, cram_checkpoint_buffer, 0,
-  "Checkpoint BUFSIZ.", 0, cram_checkpoint_buffer_update, BUFSIZ, BUFSIZ, UINT_MAX, 1);
+  "Checkpoint BUFSIZ.", 0, cram_checkpoint_buffer_update, 1024*1024, BUFSIZ, UINT_MAX, 1);
 
 static MYSQL_SYSVAR_UINT(worker_threads, cram_worker_threads, 0,
   "Workers threads per connection.", 0, cram_worker_threads_update, 2, 2, 32, 1);
