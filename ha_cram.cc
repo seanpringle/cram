@@ -35,10 +35,12 @@ uint cram_table_list_hints;
 uint cram_compress_boundary;
 uint cram_checkpoint_seconds;
 uint cram_checkpoint_threads;
+uint cram_checkpoint_buffer;
 uint cram_worker_threads;
 
 list_t *cram_tables;
 pthread_mutex_t cram_tables_lock;
+pthread_mutex_t cram_checkpoint_lock;
 
 bool checkpoint_done;
 bool checkpoint_asap;
@@ -628,6 +630,9 @@ static void* cram_checkpointer(void *p)
   snprintf(nname, sizeof(nname), "%s.new.cram", table->name);
   FILE *data = fopen(nname, "wb");
 
+  char *output = (char*) cram_alloc(cram_checkpoint_buffer);
+  setvbuf(data, output, _IOFBF, cram_checkpoint_buffer);
+
   fwrite(&table->width, 1, sizeof(size_t), data);
   fwrite(&table->lists_count, 1, sizeof(size_t), data);
   fwrite(&table->hints_width, 1, sizeof(size_t), data);
@@ -679,6 +684,8 @@ static void* cram_checkpointer(void *p)
   table->data_size = data_size;
   table->row_count = row_count;
 
+  cram_free(output);
+
   return NULL;
 }
 
@@ -695,6 +702,9 @@ static void* cram_checkpoint(void *p)
       usleep(mu); delay -= mu;
     }
     if (checkpoint_done) break;
+
+    pthread_mutex_lock(&cram_checkpoint_lock);
+
     if (checkpoint_asap) checkpoint_asap = FALSE;
 
     struct timeval time_start, time_stop;
@@ -743,6 +753,8 @@ static void* cram_checkpoint(void *p)
     }
 
     pthread_mutex_unlock(&cram_tables_lock);
+
+    pthread_mutex_unlock(&cram_checkpoint_lock);
 
     gettimeofday(&time_stop, NULL);
     cram_checkpoint_duration_usec = (time_stop.tv_sec * 1000000 + time_stop.tv_usec)
@@ -850,6 +862,7 @@ static int cram_init_func(void *p)
 
   pthread_mutex_init(&cram_tables_lock, NULL);
   pthread_mutex_init(&cram_seed_lock, NULL);
+  pthread_mutex_init(&cram_checkpoint_lock, NULL);
   pthread_create(&checkpoint_thread, NULL, cram_checkpoint, NULL);
 
   cram_tables = list_alloc();
@@ -864,6 +877,7 @@ static int cram_done_func(void *p)
 
   pthread_mutex_destroy(&cram_tables_lock);
   pthread_mutex_destroy(&cram_seed_lock);
+  pthread_mutex_destroy(&cram_checkpoint_lock);
 
   while (!list_is_empty(cram_tables))
     cram_table_drop((CramTable*)list_remove_head(cram_tables), FALSE);
@@ -1979,9 +1993,20 @@ static void cram_checkpoint_seconds_update(THD * thd, struct st_mysql_sys_var *s
 
 static void cram_checkpoint_threads_update(THD * thd, struct st_mysql_sys_var *sys_var, void *var, const void *save)
 {
+  pthread_mutex_lock(&cram_checkpoint_lock);
   uint n = *((uint*)save);
   *((uint*)var) = n;
   cram_checkpoint_threads = n;
+  pthread_mutex_unlock(&cram_checkpoint_lock);
+}
+
+static void cram_checkpoint_buffer_update(THD * thd, struct st_mysql_sys_var *sys_var, void *var, const void *save)
+{
+  pthread_mutex_lock(&cram_checkpoint_lock);
+  uint n = *((uint*)save);
+  *((uint*)var) = n;
+  cram_checkpoint_buffer = n;
+  pthread_mutex_unlock(&cram_checkpoint_lock);
 }
 
 static void cram_worker_threads_update(THD * thd, struct st_mysql_sys_var *sys_var, void *var, const void *save)
@@ -2009,6 +2034,9 @@ static MYSQL_SYSVAR_UINT(checkpoint_interval, cram_checkpoint_seconds, 0,
 static MYSQL_SYSVAR_UINT(checkpoint_threads, cram_checkpoint_threads, 0,
   "Checkpoint threads.", 0, cram_checkpoint_threads_update, 4, 2, 32, 1);
 
+static MYSQL_SYSVAR_UINT(checkpoint_buffer, cram_checkpoint_buffer, 0,
+  "Checkpoint BUFSIZ.", 0, cram_checkpoint_buffer_update, BUFSIZ, BUFSIZ, UINT_MAX, 1);
+
 static MYSQL_SYSVAR_UINT(worker_threads, cram_worker_threads, 0,
   "Workers threads per connection.", 0, cram_worker_threads_update, 2, 2, 32, 1);
 
@@ -2019,6 +2047,7 @@ static struct st_mysql_sys_var *cram_system_variables[] = {
     MYSQL_SYSVAR(compress_boundary),
     MYSQL_SYSVAR(checkpoint_interval),
     MYSQL_SYSVAR(checkpoint_threads),
+    MYSQL_SYSVAR(checkpoint_buffer),
     MYSQL_SYSVAR(worker_threads),
     NULL
 };
