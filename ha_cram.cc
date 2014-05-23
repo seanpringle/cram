@@ -677,7 +677,7 @@ static void* cram_checkpointer(void *p)
     }
 
     pthread_mutex_unlock(&table->locks[li]);
-    usleep(1000);
+    usleep(10);
   }
   fclose(data);
   rename(nname, fname);
