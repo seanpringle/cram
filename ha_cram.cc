@@ -925,8 +925,12 @@ void ha_cram::empty_conds()
     {
       CramCondition *cc = (CramCondition*) list_remove_head(cram_conds);
 
-      while (cc->items && cc->items->length)
-        cram_free(list_remove_head(cc->items));
+      if (cc->items)
+      {
+        while (cc->items->length)
+          cram_free(list_remove_head(cc->items));
+        list_free(cc->items);
+      }
       cram_free(cc);
     }
 
@@ -1342,7 +1346,7 @@ static bool ecp_check_row(list_t *conds, CramTable *table, CramRow *row)
 
     // compressed fields go no matter what
     if (cram_field_type(field) == CRAM_STRING && cram_field_length_string(field) != length)
-      break;
+      continue;
 
     int64 ni64;
 
@@ -1991,10 +1995,10 @@ static MYSQL_SYSVAR_UINT(verbose, cram_verbose, 0,
   "Debug noise to stderr.", 0, cram_verbose_update, 0, 0, 1, 1);
 
 static MYSQL_SYSVAR_UINT(table_lists, cram_table_lists, 0,
-  "Partitions per table.", 0, cram_table_lists_update, 1024, 8, UINT_MAX, 1);
+  "Lists per table.", 0, cram_table_lists_update, 128, 8, UINT_MAX, 1);
 
 static MYSQL_SYSVAR_UINT(table_list_hints, cram_table_list_hints, 0,
-  "Width of table list hints bitmap.", 0, cram_table_list_hints_update, 512, 128, UINT_MAX, 1);
+  "Width of table list hints bitmap.", 0, cram_table_list_hints_update, 128, 128, UINT_MAX, 1);
 
 static MYSQL_SYSVAR_UINT(compress_boundary, cram_compress_boundary, 0,
   "Compress strings longer than N bytes.", 0, cram_compress_boundary_update, 128, 32, UINT_MAX, 1);
