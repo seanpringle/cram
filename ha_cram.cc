@@ -686,7 +686,9 @@ static void* cram_checkpointer(void *p)
   table->row_count = row_count;
 
   cram_free(output);
+  pthread_mutex_lock(&checkpoint->mutex);
   checkpoint->done = TRUE;
+  pthread_mutex_unlock(&checkpoint->mutex);
 
   return NULL;
 }
