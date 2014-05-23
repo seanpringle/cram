@@ -729,10 +729,12 @@ static void* cram_checkpoint(void *p)
     pthread_mutex_unlock(&cram_tables_lock);
 
     CramCheckpoint writers[cram_checkpoint_threads];
+    memset(writers, 0, sizeof(CramCheckpoint) * cram_checkpoint_threads);
 
     for (uint i = 0; i < cram_checkpoint_threads; i++)
     {
-      writers[i].idle = TRUE;
+      writers[i].done  = FALSE;
+      writers[i].idle  = TRUE;
       pthread_mutex_init(&writers[i].mutex, NULL);
     }
 
@@ -750,9 +752,7 @@ static void* cram_checkpoint(void *p)
 
           if (writers[i].done)
           {
-            pthread_mutex_unlock(&writers[i].mutex);
             pthread_join(writers[i].thread, NULL);
-            pthread_mutex_lock(&writers[i].mutex);
             writers[i].idle = TRUE;
             writers[i].done = FALSE;
 
