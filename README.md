@@ -26,4 +26,4 @@ Right! The aims are:
 
 A bitmap is maintained per column per list. When writing a record each field is hashed, modulo calculated, and a bit set. When scanning for records, *Engine Condition Pushdown* with equality conditions -- WHERE clauses with *=* or *IN()* -- allow the engine to check bitmaps and skip irrelevant lists.
 
-The astute reader can probably predict the potential pitfalls with this approach. By configuring the number of lists and the width of the bitmaps a table can be tuned for a specific combination of memory usage, concurrency, and speed.
+The astute reader can probably predict the potential pitfalls with this approach. However, by configuring the number of lists and the width of the bitmaps a table can be tuned for a specific combination of memory usage, concurrency, and speed.
