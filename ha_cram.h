@@ -62,6 +62,12 @@ typedef struct _CramTable {
   uint64 meta_size;
   uint64 data_size;
   THR_LOCK mysql_lock;
+  uint64 rows_indexed;
+  uint64 rows_touched;
+  uint64 rows_selected;
+  uint64 rows_inserted;
+  uint64 rows_updated;
+  uint64 rows_deleted;
 } CramTable;
 
 typedef struct _CramPosition {
@@ -140,7 +146,7 @@ class ha_cram: public handler
   uint64 counter_rows_indexed;
   uint64 counter_rows_touched;
   uint64 counter_rows_selected;
-  uint64 counter_rows_written;
+  uint64 counter_rows_inserted;
   uint64 counter_rows_updated;
   uint64 counter_rows_deleted;
 
@@ -213,5 +219,6 @@ public:
   void use_conds();
   void check_condition ( const COND * cond );
   void clear_state();
+  void log_state();
   void update_list_hints(uint part, CramRow *row);
 };
